@@ -6,10 +6,32 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 
 // Config
-const LLM_URL: &str = "http://localhost:11434/api/chat";
-const MODEL: &str = "qwen3.5:latest";
-const MAX_ITERATIONS: usize = 20;
+const DEFAULT_LLM_URL: &str = "http://localhost:11434/api/chat";
+const DEFAULT_MODEL: &str = "qwen3.5:latest";
+const DEFAULT_MAX_ITERATIONS: usize = 20;
+
+pub struct AgentDefinition {
+    pub name: String,
+    pub system_prompt_preamble: String,
+    pub llm_url: String,
+    pub model: String,
+    pub max_iterations: usize,
+}
+
+impl Default for AgentDefinition {
+    fn default() -> Self {
+        Self {
+            name: "Personal Assistant".to_string(),
+            system_prompt_preamble: "You are a helpful Personal Assistant agent.".to_string(),
+            llm_url: DEFAULT_LLM_URL.to_string(),
+            model: DEFAULT_MODEL.to_string(),
+            max_iterations: DEFAULT_MAX_ITERATIONS,
+        }
+    }
+}
+
 pub struct Agent {
+    definition: AgentDefinition,
     tools: ToolRegistry,
     ctx: ToolContext,
 }
@@ -21,10 +43,15 @@ enum StepOutcome {
 
 impl Agent {
     pub(crate) fn new() -> Result<Self, String> {
+        Self::with_definition(AgentDefinition::default())
+    }
+
+    pub(crate) fn with_definition(definition: AgentDefinition) -> Result<Self, String> {
         let ctx = build_context();
         ensure_dirs(&ctx)?;
 
         Ok(Self {
+            definition,
             tools: build_tools(),
             ctx,
         })
@@ -32,7 +59,8 @@ impl Agent {
 
     fn system_prompt(&self) -> String {
         format!(
-            r#"You are a helpful Personal Assistant agent. Use tools via JSON calls when needed.
+            r#"You are {}.
+{} Use tools via JSON calls when needed.
 - Process each incoming user message as a loop:
   1. Receive the message.
   2. Interpret it.
@@ -45,6 +73,8 @@ impl Agent {
 - When done, respond with plain text.
 Available tools: {}
 Workspace: {}"#,
+            self.definition.name,
+            self.definition.system_prompt_preamble,
             tool_catalog_json(&self.tools),
             self.ctx.workspace_dir.display()
         )
@@ -92,13 +122,13 @@ Workspace: {}"#,
 
     fn call_llm(&self, messages: &[Value]) -> Result<Value, String> {
         let payload = json!({
-            "model": MODEL,
+            "model": self.definition.model,
             "messages": messages,
             "stream": false,
             "tools": tools_payload(&self.tools),
         });
 
-        let data = post_json(LLM_URL, &payload, 60)?;
+        let data = post_json(&self.definition.llm_url, &payload, 60)?;
         data.get("message")
             .cloned()
             .ok_or_else(|| "Missing `message` in LLM response.".to_string())
@@ -184,7 +214,7 @@ Workspace: {}"#,
             "content": user_message
         }));
 
-        for _ in 0..MAX_ITERATIONS {
+        for _ in 0..self.definition.max_iterations {
             match self.step(&mut messages) {
                 Ok(StepOutcome::Final(content)) => {
                     let _ = self.save_messages(session_id, &messages);
