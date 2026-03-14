@@ -1,3 +1,5 @@
+
+## Agentic Loop Version 0.1.0
 ```
 Algorithm AgentRun(session_id, user_message):
 
