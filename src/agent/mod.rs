@@ -40,8 +40,14 @@ pub struct Agent {
 }
 
 enum StepOutcome {
+    Continue,
     Final(String),
-    ToolResults(Vec<Message>),
+}
+
+struct ToolInvocation {
+    name: String,
+    args: Value,
+    call_id: Option<String>,
 }
 
 impl Agent {
@@ -158,63 +164,86 @@ Workspace: {}"#,
         Some((tool_name, args))
     }
 
-    fn step(&self, messages: &mut Vec<Message>) -> Result<StepOutcome, String> {
-        let assistant_message = self.call_llm(messages)?;
-        let prev_message_id = messages.last().map(|message| message.message_id.clone());
-        messages.push(Message::out(assistant_message.clone(), prev_message_id));
+    fn persist(&self, session_id: &str, messages: &[Message]) {
+        let _ = self.save_messages(session_id, messages);
+    }
 
-        let tool_calls = assistant_message
+    fn push_out_message(messages: &mut Vec<Message>, value: Value) {
+        let prev_message_id = messages.last().map(|message| message.message_id.clone());
+        messages.push(Message::out(value, prev_message_id));
+    }
+
+    fn extract_tool_invocations(&self, assistant_message: &Value) -> Vec<ToolInvocation> {
+        let native_calls = assistant_message
             .get("tool_calls")
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
 
-        if !tool_calls.is_empty() {
-            let mut tool_results = Vec::new();
-
-            for tc in tool_calls {
-                let tool_name = tc
-                    .get("function")
-                    .and_then(|f| f.get("name"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-
-                let tool_call_id = tc.get("id").and_then(Value::as_str);
-
-                let args = tc
-                    .get("function")
-                    .and_then(|f| f.get("arguments"))
-                    .cloned()
-                    .unwrap_or(Value::Null);
-
-                let prev_message_id = messages.last().map(|message| message.message_id.clone());
-                tool_results.push(Message::out(
-                    self.tool_executor.build_tool_message(
-                        &self.tool_registry,
-                        tool_name,
-                        &args,
-                        &self.ctx,
-                        tool_call_id,
-                    ),
-                    prev_message_id,
-                ));
-            }
-
-            return Ok(StepOutcome::ToolResults(tool_results));
+        if !native_calls.is_empty() {
+            return native_calls
+                .into_iter()
+                .map(|tool_call| ToolInvocation {
+                    name: tool_call
+                        .get("function")
+                        .and_then(|function| function.get("name"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    args: tool_call
+                        .get("function")
+                        .and_then(|function| function.get("arguments"))
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                    call_id: tool_call.get("id").and_then(Value::as_str).map(str::to_string),
+                })
+                .collect();
         }
 
-        if let Some((tool_name, args)) = self.parse_content_tool_call(&assistant_message) {
-            let prev_message_id = messages.last().map(|message| message.message_id.clone());
-            return Ok(StepOutcome::ToolResults(vec![Message::out(
-                self.tool_executor.build_tool_message(
-                    &self.tool_registry,
-                    &tool_name,
-                    &args,
-                    &self.ctx,
-                    None,
-                ),
-                prev_message_id,
-            )]));
+        self.parse_content_tool_call(assistant_message)
+            .map(|(name, args)| {
+                vec![ToolInvocation {
+                    name,
+                    args,
+                    call_id: None,
+                }]
+            })
+            .unwrap_or_default()
+    }
+
+    fn build_tool_result_messages(
+        &self,
+        invocations: Vec<ToolInvocation>,
+        parent_message_id: Option<String>,
+    ) -> Vec<Message> {
+        invocations
+            .into_iter()
+            .map(|invocation| {
+                Message::out(
+                    self.tool_executor.build_tool_message(
+                        &self.tool_registry,
+                        &invocation.name,
+                        &invocation.args,
+                        &self.ctx,
+                        invocation.call_id.as_deref(),
+                    ),
+                    parent_message_id.clone(),
+                )
+            })
+            .collect()
+    }
+
+    fn step(&self, messages: &mut Vec<Message>) -> Result<StepOutcome, String> {
+        let assistant_message = self.call_llm(messages)?;
+        Self::push_out_message(messages, assistant_message.clone());
+
+        let parent_message_id = messages.last().map(|message| message.message_id.clone());
+        let invocations = self.extract_tool_invocations(&assistant_message);
+
+        if !invocations.is_empty() {
+            let tool_messages = self.build_tool_result_messages(invocations, parent_message_id);
+            messages.extend(tool_messages);
+            return Ok(StepOutcome::Continue);
         }
 
         let content = assistant_message
@@ -240,18 +269,18 @@ Workspace: {}"#,
 
         for _ in 0..self.definition.max_iterations {
             match self.step(&mut messages) {
-                Ok(StepOutcome::Final(content)) => {
-                    let _ = self.save_messages(session_id, &messages);
-                    return content;
+                Ok(StepOutcome::Continue) => {
+                    self.persist(session_id, &messages);
                 }
-                Ok(StepOutcome::ToolResults(tool_messages)) => {
-                    messages.extend(tool_messages);
-                    let _ = self.save_messages(session_id, &messages);
+                Ok(StepOutcome::Final(content)) => {
+                    self.persist(session_id, &messages);
+                    return content;
                 }
                 Err(e) => return format!("LLM error: {e}"),
             }
         }
 
+        self.persist(session_id, &messages);
         "Max iterations reached.".to_string()
     }
 }
