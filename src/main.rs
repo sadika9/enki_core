@@ -8,10 +8,9 @@ use crate::tooling::types::*;
 
 use crate::agent::Agent;
 use reqwest::blocking::Client;
-use serde_json::{Map, Value};
+use serde_json::Value;
 use std::env;
 use std::fs::{self};
-use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -42,20 +41,6 @@ fn ensure_dirs(ctx: &ToolContext) -> Result<(), String> {
 
 fn build_tools() -> ToolRegistry {
     register_tools![ReadFileTool, WriteFileTool, ExecTool]
-}
-
-fn tool_catalog_json(tools: &ToolRegistry) -> Value {
-    let mut map = Map::new();
-
-    for tool in tools.values() {
-        map.insert(tool.name().to_string(), tool.as_catalog_entry());
-    }
-
-    Value::Object(map)
-}
-
-fn tools_payload(tools: &ToolRegistry) -> Vec<Value> {
-    tools.values().map(|tool| tool.as_tool_payload()).collect()
 }
 
 fn post_json(url: &str, payload: &Value, timeout_secs: u64) -> Result<Value, String> {

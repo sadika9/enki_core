@@ -1,8 +1,9 @@
-use std::io::Write;
-use crate::tooling::types::{ToolContext, ToolRegistry};
-use crate::{build_context, build_tools, ensure_dirs, post_json, tool_catalog_json, tools_payload};
+use crate::tooling::tool_calling::{RegistryToolExecutor, ToolCallRegistry, ToolExecutor};
+use crate::tooling::types::ToolContext;
+use crate::{build_context, build_tools, ensure_dirs, post_json};
 use serde_json::{Value, json};
 use std::fs::File;
+use std::io::Write;
 use std::io::{BufRead, BufReader};
 
 // Config
@@ -32,7 +33,8 @@ impl Default for AgentDefinition {
 
 pub struct Agent {
     definition: AgentDefinition,
-    tools: ToolRegistry,
+    tool_registry: ToolCallRegistry,
+    tool_executor: Box<dyn ToolExecutor>,
     ctx: ToolContext,
 }
 
@@ -47,12 +49,20 @@ impl Agent {
     }
 
     pub(crate) fn with_definition(definition: AgentDefinition) -> Result<Self, String> {
+        Self::with_definition_and_executor(definition, Box::new(RegistryToolExecutor))
+    }
+
+    pub(crate) fn with_definition_and_executor(
+        definition: AgentDefinition,
+        tool_executor: Box<dyn ToolExecutor>,
+    ) -> Result<Self, String> {
         let ctx = build_context();
         ensure_dirs(&ctx)?;
 
         Ok(Self {
             definition,
-            tools: build_tools(),
+            tool_registry: ToolCallRegistry::new(build_tools()),
+            tool_executor,
             ctx,
         })
     }
@@ -75,7 +85,7 @@ Available tools: {}
 Workspace: {}"#,
             self.definition.name,
             self.definition.system_prompt_preamble,
-            tool_catalog_json(&self.tools),
+            self.tool_registry.catalog_json(),
             self.ctx.workspace_dir.display()
         )
     }
@@ -125,7 +135,7 @@ Workspace: {}"#,
             "model": self.definition.model,
             "messages": messages,
             "stream": false,
-            "tools": tools_payload(&self.tools),
+            "tools": self.tool_registry.tools_payload(),
         });
 
         let data = post_json(&self.definition.llm_url, &payload, 60)?;
@@ -140,13 +150,6 @@ Workspace: {}"#,
         let tool_name = parsed.get("tool")?.as_str()?.to_string();
         let args = parsed.get("args").cloned().unwrap_or(Value::Null);
         Some((tool_name, args))
-    }
-
-    fn execute_named_tool(&self, tool_name: &str, args: &Value) -> String {
-        match self.tools.get(tool_name) {
-            Some(tool) => tool.execute(args, &self.ctx),
-            None => format!("Unknown tool: {tool_name}"),
-        }
     }
 
     fn step(&self, messages: &mut Vec<Value>) -> Result<StepOutcome, String> {
@@ -175,26 +178,26 @@ Workspace: {}"#,
                     .cloned()
                     .unwrap_or(Value::Null);
 
-                let result = self.execute_named_tool(tool_name, &args);
-
-                tool_results.push(json!({
-                    "role": "tool",
-                    "tool_name": tool_name,
-                    "content": result
-                }));
+                tool_results.push(self.tool_executor.build_tool_message(
+                    &self.tool_registry,
+                    tool_name,
+                    &args,
+                    &self.ctx,
+                ));
             }
 
             return Ok(StepOutcome::ToolResults(tool_results));
         }
 
         if let Some((tool_name, args)) = self.parse_content_tool_call(&assistant_message) {
-            let result = self.execute_named_tool(&tool_name, &args);
-
-            return Ok(StepOutcome::ToolResults(vec![json!({
-                "role": "tool",
-                "tool_name": tool_name,
-                "content": result
-            })]));
+            return Ok(StepOutcome::ToolResults(vec![
+                self.tool_executor.build_tool_message(
+                    &self.tool_registry,
+                    &tool_name,
+                    &args,
+                    &self.ctx,
+                ),
+            ]));
         }
 
         let content = assistant_message
