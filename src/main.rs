@@ -2,12 +2,12 @@
 mod macros;
 pub mod tooling;
 
+use std::collections::BTreeMap;
+use crate::tooling::builtin_tools::{ExecTool, ReadFileTool, WriteFileTool};
 use crate::tooling::types::*;
 
-use crate::tooling::builtin_tools::{ExecTool, ReadFileTool, WriteFileTool};
 use reqwest::blocking::Client;
-use serde_json::{json, Map, Value};
-use std::collections::BTreeMap;
+use serde_json::{Map, Value, json};
 use std::env;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
@@ -62,18 +62,6 @@ fn tools_payload(tools: &ToolRegistry) -> Vec<Value> {
     tools.values().map(|tool| tool.as_tool_payload()).collect()
 }
 
-fn system_prompt(tools: &ToolRegistry, ctx: &ToolContext) -> String {
-    format!(
-        r#"You are a helpful Personal Assistant agent. Use tools via JSON calls when needed.
-- To use a tool: respond with ONLY {{"tool": "tool_name", "args": {{...}}}}
-- When done, respond with plain text answer.
-Available tools: {}
-Workspace: {}"#,
-        tool_catalog_json(tools),
-        ctx.workspace_dir.display()
-    )
-}
-
 fn post_json(url: &str, payload: &Value, timeout_secs: u64) -> Result<Value, String> {
     let client = Client::builder()
         .timeout(Duration::from_secs(timeout_secs))
@@ -97,132 +85,176 @@ fn post_json(url: &str, payload: &Value, timeout_secs: u64) -> Result<Value, Str
     serde_json::from_str(&body).map_err(|e| format!("Invalid JSON response: {e}"))
 }
 
-fn load_session(session_id: &str, system_prompt: &str, ctx: &ToolContext) -> Vec<Value> {
-    let session_file = ctx.sessions_dir.join(format!("{session_id}.jsonl"));
+struct Agent {
+    tools: ToolRegistry,
+    ctx: ToolContext,
+}
 
-    if session_file.exists() {
-        if let Ok(file) = File::open(&session_file) {
-            let reader = BufReader::new(file);
-            let messages: Vec<Value> = reader
-                .lines()
-                .filter_map(Result::ok)
-                .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
-                .collect();
+impl Agent {
+    fn new() -> Result<Self, String> {
+        let ctx = build_context();
+        ensure_dirs(&ctx)?;
 
-            if !messages.is_empty() {
-                return messages;
+        Ok(Self {
+            tools: build_tools(),
+            ctx,
+        })
+    }
+
+    fn system_prompt(&self) -> String {
+        format!(
+            r#"You are a helpful Personal Assistant agent. Use tools via JSON calls when needed.
+- To use a tool: respond with ONLY {{"tool": "tool_name", "args": {{...}}}}
+- When done, respond with plain text answer.
+Available tools: {}
+Workspace: {}"#,
+            tool_catalog_json(&self.tools),
+            self.ctx.workspace_dir.display()
+        )
+    }
+
+    fn load_session(&self, session_id: &str) -> Vec<Value> {
+        let session_file = self.ctx.sessions_dir.join(format!("{session_id}.jsonl"));
+
+        if session_file.exists() {
+            if let Ok(file) = File::open(&session_file) {
+                let reader = BufReader::new(file);
+                let messages: Vec<Value> = reader
+                    .lines()
+                    .filter_map(Result::ok)
+                    .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
+                    .collect();
+
+                if !messages.is_empty() {
+                    return messages;
+                }
             }
         }
+
+        vec![json!({
+            "role": "system",
+            "content": self.system_prompt()
+        })]
     }
 
-    vec![json!({
-        "role": "system",
-        "content": system_prompt
-    })]
-}
+    fn save_messages(&self, session_id: &str, messages: &[Value]) -> Result<(), String> {
+        let session_file = self.ctx.sessions_dir.join(format!("{session_id}.jsonl"));
+        let start = messages.len().saturating_sub(10);
 
-fn save_messages(session_id: &str, messages: &[Value], ctx: &ToolContext) -> Result<(), String> {
-    let session_file = ctx.sessions_dir.join(format!("{session_id}.jsonl"));
-    let start = messages.len().saturating_sub(10);
+        let mut file = File::create(&session_file)
+            .map_err(|e| format!("Failed to open session file for writing: {e}"))?;
 
-    let mut file = File::create(&session_file)
-        .map_err(|e| format!("Failed to open session file for writing: {e}"))?;
+        for msg in &messages[start..] {
+            let line = serde_json::to_string(msg)
+                .map_err(|e| format!("Failed to serialize message: {e}"))?;
+            writeln!(file, "{line}").map_err(|e| format!("Failed to write session file: {e}"))?;
+        }
 
-    for msg in &messages[start..] {
-        let line =
-            serde_json::to_string(msg).map_err(|e| format!("Failed to serialize message: {e}"))?;
-        writeln!(file, "{line}").map_err(|e| format!("Failed to write session file: {e}"))?;
+        Ok(())
     }
 
-    Ok(())
-}
-
-fn call_llm(messages: &[Value], tools: &ToolRegistry) -> String {
-    let payload = json!({
+    fn call_llm(&self, messages: &[Value]) -> Result<Value, String> {
+        let payload = json!({
         "model": MODEL,
         "messages": messages,
         "stream": false,
-        "tools": tools_payload(tools),
+        "tools": tools_payload(&self.tools),
     });
 
-    match post_json(LLM_URL, &payload, 60) {
-        Ok(data) => data
-            .get("message")
-            .and_then(|m| m.get("content"))
+        let data = post_json(LLM_URL, &payload, 60)?;
+        data.get("message")
+            .cloned()
+            .ok_or_else(|| "Missing `message` in LLM response.".to_string())
+    }
+
+    fn execute_tool(&self, tool_call: &Value) -> String {
+        let tool_name = tool_call
+            .get("tool")
             .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
-        Err(e) => format!("LLM error: {e}"),
+            .unwrap_or_default();
+
+        let args = tool_call.get("args").unwrap_or(&Value::Null);
+
+        match self.tools.get(tool_name) {
+            Some(tool) => tool.execute(args, &self.ctx),
+            None => "Unknown tool.".to_string(),
+        }
     }
-}
 
-fn execute_tool(tool_call: &Value, tools: &ToolRegistry, ctx: &ToolContext) -> String {
-    let tool_name = tool_call
-        .get("tool")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+    fn run(&self, session_id: &str, user_message: &str) -> String {
+        let mut messages = self.load_session(session_id);
 
-    let args = tool_call.get("args").unwrap_or(&Value::Null);
-
-    match tools.get(tool_name) {
-        Some(tool) => tool.execute(args, ctx),
-        None => "Unknown tool.".to_string(),
-    }
-}
-
-fn agent_loop(
-    session_id: &str,
-    user_message: &str,
-    tools: &ToolRegistry,
-    ctx: &ToolContext,
-) -> String {
-    let prompt = system_prompt(tools, ctx);
-    let mut messages = load_session(session_id, &prompt, ctx);
-
-    messages.push(json!({
+        messages.push(json!({
         "role": "user",
         "content": user_message
     }));
 
-    for _ in 0..MAX_ITERATIONS {
-        let llm_response = call_llm(&messages, tools);
+        for _ in 0..MAX_ITERATIONS {
+            let assistant_message = match self.call_llm(&messages) {
+                Ok(msg) => msg,
+                Err(e) => return format!("LLM error: {e}"),
+            };
 
-        messages.push(json!({
-            "role": "assistant",
-            "content": llm_response
-        }));
+            messages.push(assistant_message.clone());
 
-        if let Ok(tool_call) = serde_json::from_str::<Value>(&llm_response) {
-            if tool_call.is_object() && tool_call.get("tool").is_some() {
-                let result = execute_tool(&tool_call, tools, ctx);
+            let tool_calls = assistant_message
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+
+            if tool_calls.is_empty() {
+                let content = assistant_message
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+
+                let _ = self.save_messages(session_id, &messages);
+                return content;
+            }
+
+            for tc in tool_calls {
+                let tool_name = tc
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+
+                let args = tc
+                    .get("function")
+                    .and_then(|f| f.get("arguments"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+
+                let result = match self.tools.get(tool_name) {
+                    Some(tool) => tool.execute(&args, &self.ctx),
+                    None => format!("Unknown tool: {tool_name}"),
+                };
 
                 messages.push(json!({
-                    "role": "tool",
-                    "content": result,
-                    "tool_call_id": "1"
-                }));
-
-                let _ = save_messages(session_id, &messages, ctx);
-                continue;
+                "role": "tool",
+                "tool_name": tool_name,
+                "content": result
+            }));
             }
+
+            let _ = self.save_messages(session_id, &messages);
         }
 
-        let _ = save_messages(session_id, &messages, ctx);
-        return llm_response;
+        "Max iterations reached.".to_string()
     }
-
-    "Max iterations reached.".to_string()
 }
 
 fn main() {
-    let ctx = build_context();
+    let agent = match Agent::new() {
+        Ok(agent) => agent,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
 
-    if let Err(e) = ensure_dirs(&ctx) {
-        eprintln!("{e}");
-        std::process::exit(1);
-    }
-
-    let tools = build_tools();
     let args: Vec<String> = env::args().collect();
 
     if args.len() < 3 {
@@ -233,6 +265,6 @@ fn main() {
     let session_id = &args[1];
     let message = args[2..].join(" ");
 
-    let response = agent_loop(session_id, &message, &tools, &ctx);
+    let response = agent.run(session_id, &message);
     println!("{response}");
 }
