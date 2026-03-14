@@ -68,9 +68,10 @@ impl Agent {
     }
 
     pub(crate) async fn with_definition(definition: AgentDefinition) -> Result<Self, String> {
-        Self::with_definition_executor_and_workspace(
+        Self::with_definition_executor_llm_and_workspace(
             definition,
             Box::new(RegistryToolExecutor),
+            None,
             None,
         )
         .await
@@ -80,7 +81,8 @@ impl Agent {
         definition: AgentDefinition,
         tool_executor: Box<dyn ToolExecutor>,
     ) -> Result<Self, String> {
-        Self::with_definition_executor_and_workspace(definition, tool_executor, None).await
+        Self::with_definition_executor_llm_and_workspace(definition, tool_executor, None, None)
+            .await
     }
 
     pub(crate) async fn with_definition_executor_and_workspace(
@@ -88,12 +90,33 @@ impl Agent {
         tool_executor: Box<dyn ToolExecutor>,
         workspace_home: Option<PathBuf>,
     ) -> Result<Self, String> {
-        let model = Self::resolve_model(&definition)?;
+        Self::with_definition_executor_llm_and_workspace(
+            definition,
+            tool_executor,
+            None,
+            workspace_home,
+        )
+        .await
+    }
+
+    pub(crate) async fn with_definition_executor_llm_and_workspace(
+        definition: AgentDefinition,
+        tool_executor: Box<dyn ToolExecutor>,
+        llm: Option<Box<dyn LlmProvider>>,
+        workspace_home: Option<PathBuf>,
+    ) -> Result<Self, String> {
         let workspace = AgentWorkspace::new(&definition.name, workspace_home);
         workspace.ensure_dirs().await?;
+        let llm = match llm {
+            Some(llm) => llm,
+            None => {
+                let model = Self::resolve_model(&definition)?;
+                Box::new(UniversalLLMClient::new(&model).map_err(|e| e.to_string())?)
+            }
+        };
 
         Ok(Self {
-            llm: Box::new(UniversalLLMClient::new(&model).map_err(|e| e.to_string())?),
+            llm,
             definition,
             tool_registry: ToolCallRegistry::new(build_tools()),
             tool_executor,

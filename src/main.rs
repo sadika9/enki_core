@@ -1,11 +1,12 @@
 #[macro_use]
 mod macros;
 pub mod agent;
+pub mod llm;
 pub mod message;
 pub mod runtime;
 pub mod tooling;
-pub mod llm;
 
+use crate::llm::UniversalLLMClient;
 use crate::runtime::{CliChannel, RuntimeBuilder};
 use crate::tooling::builtin_tools::{ExecTool, ReadFileTool, WriteFileTool};
 use crate::tooling::types::*;
@@ -18,7 +19,13 @@ fn build_tools() -> ToolRegistry {
 #[tokio::main]
 async fn main() {
     let runtime = match RuntimeBuilder::for_default_agent()
-        .with_model("ollama::qwen3.5")
+        .with_llm(Box::new(match UniversalLLMClient::new("ollama::qwen3.5") {
+            Ok(llm) => llm,
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }))
         .with_workspace_home("./")
         .build()
         .await
