@@ -1,14 +1,12 @@
 use crate::tooling::types::*;
 macro_rules! define_tool {
     (
-        $tool_type:ident,
+        $tool_type:ty,
         name: $name:literal,
         description: $description:literal,
         parameters: $parameters:expr,
         |$args:ident, $ctx:ident| $body:block
     ) => {
-        struct $tool_type;
-
         impl Tool for $tool_type {
             fn name(&self) -> &'static str {
                 $name

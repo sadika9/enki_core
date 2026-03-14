@@ -4,109 +4,20 @@ pub mod tooling;
 
 use crate::tooling::types::*;
 
+use crate::tooling::builtin_tools::{ExecTool, ReadFileTool, WriteFileTool};
 use reqwest::blocking::Client;
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::env;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
 use std::time::Duration;
 
 // Config
 const LLM_URL: &str = "http://localhost:11434/api/chat";
 const MODEL: &str = "qwen3.5:latest";
 const MAX_ITERATIONS: usize = 20;
-
-define_tool!(
-    ReadFileTool,
-    name: "read_file",
-    description: "Read file content.",
-    parameters: json!({
-        "type": "object",
-        "properties": {
-            "path": { "type": "string" }
-        },
-        "required": ["path"]
-    }),
-    |args, _ctx| {
-        let path = args
-            .get("path")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-
-        match fs::read_to_string(Path::new(path)) {
-            Ok(content) => content,
-            Err(_) => "File not found.".to_string(),
-        }
-    }
-);
-
-define_tool!(
-    WriteFileTool,
-    name: "write_file",
-    description: "Write content to file.",
-    parameters: json!({
-        "type": "object",
-        "properties": {
-            "path": { "type": "string" },
-            "content": { "type": "string" }
-        },
-        "required": ["path", "content"]
-    }),
-    |args, _ctx| {
-        let path = args
-            .get("path")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-
-        let content = args
-            .get("content")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-
-        match fs::write(Path::new(path), content) {
-            Ok(_) => "File written.".to_string(),
-            Err(e) => format!("Error: {e}"),
-        }
-    }
-);
-
-define_tool!(
-    ExecTool,
-    name: "exec",
-    description: "Execute shell command safely.",
-    parameters: json!({
-        "type": "object",
-        "properties": {
-            "cmd": { "type": "string" }
-        },
-        "required": ["cmd"]
-    }),
-    |args, ctx| {
-        let cmd = args
-            .get("cmd")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-
-        match Command::new("sh")
-            .arg("-c")
-            .arg(cmd)
-            .current_dir(&ctx.workspace_dir)
-            .output()
-        {
-            Ok(result) => {
-                let stdout = String::from_utf8_lossy(&result.stdout);
-                let stderr = String::from_utf8_lossy(&result.stderr);
-                let rc = result.status.code().unwrap_or(-1);
-
-                format!("stdout: {stdout}\nstderr: {stderr}\nrc: {rc}")
-            }
-            Err(e) => format!("Exec error: {e}"),
-        }
-    }
-);
 
 fn api_key() -> Option<String> {
     None
