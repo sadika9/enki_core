@@ -2,7 +2,6 @@
 mod macros;
 pub mod tooling;
 
-use std::collections::BTreeMap;
 use crate::tooling::builtin_tools::{ExecTool, ReadFileTool, WriteFileTool};
 use crate::tooling::types::*;
 
@@ -90,6 +89,11 @@ struct Agent {
     ctx: ToolContext,
 }
 
+enum StepOutcome {
+    Final(String),
+    ToolResults(Vec<Value>),
+}
+
 impl Agent {
     fn new() -> Result<Self, String> {
         let ctx = build_context();
@@ -104,8 +108,16 @@ impl Agent {
     fn system_prompt(&self) -> String {
         format!(
             r#"You are a helpful Personal Assistant agent. Use tools via JSON calls when needed.
-- To use a tool: respond with ONLY {{"tool": "tool_name", "args": {{...}}}}
-- When done, respond with plain text answer.
+- Process each incoming user message as a loop:
+  1. Receive the message.
+  2. Interpret it.
+  3. Choose the next action.
+  4. Either reply immediately, call a tool, or ask a follow-up question.
+  5. If you call a tool, read the result and continue the loop.
+  6. Stop only when a final reply is ready.
+- One user message may require multiple internal iterations before the final answer.
+- If a tool is needed, prefer native tool calls. If native tool calling is unavailable, respond with ONLY {{"tool": "tool_name", "args": {{...}}}}.
+- When done, respond with plain text.
 Available tools: {}
 Workspace: {}"#,
             tool_catalog_json(&self.tools),
@@ -167,52 +179,33 @@ Workspace: {}"#,
             .ok_or_else(|| "Missing `message` in LLM response.".to_string())
     }
 
-    fn execute_tool(&self, tool_call: &Value) -> String {
-        let tool_name = tool_call
-            .get("tool")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
+    fn parse_content_tool_call(&self, assistant_message: &Value) -> Option<(String, Value)> {
+        let content = assistant_message.get("content")?.as_str()?;
+        let parsed: Value = serde_json::from_str(content).ok()?;
+        let tool_name = parsed.get("tool")?.as_str()?.to_string();
+        let args = parsed.get("args").cloned().unwrap_or(Value::Null);
+        Some((tool_name, args))
+    }
 
-        let args = tool_call.get("args").unwrap_or(&Value::Null);
-
+    fn execute_named_tool(&self, tool_name: &str, args: &Value) -> String {
         match self.tools.get(tool_name) {
             Some(tool) => tool.execute(args, &self.ctx),
-            None => "Unknown tool.".to_string(),
+            None => format!("Unknown tool: {tool_name}"),
         }
     }
 
-    fn run(&self, session_id: &str, user_message: &str) -> String {
-        let mut messages = self.load_session(session_id);
+    fn step(&self, messages: &mut Vec<Value>) -> Result<StepOutcome, String> {
+        let assistant_message = self.call_llm(messages)?;
+        messages.push(assistant_message.clone());
 
-        messages.push(json!({
-        "role": "user",
-        "content": user_message
-    }));
+        let tool_calls = assistant_message
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
 
-        for _ in 0..MAX_ITERATIONS {
-            let assistant_message = match self.call_llm(&messages) {
-                Ok(msg) => msg,
-                Err(e) => return format!("LLM error: {e}"),
-            };
-
-            messages.push(assistant_message.clone());
-
-            let tool_calls = assistant_message
-                .get("tool_calls")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-
-            if tool_calls.is_empty() {
-                let content = assistant_message
-                    .get("content")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-
-                let _ = self.save_messages(session_id, &messages);
-                return content;
-            }
+        if !tool_calls.is_empty() {
+            let mut tool_results = Vec::new();
 
             for tc in tool_calls {
                 let tool_name = tc
@@ -227,19 +220,57 @@ Workspace: {}"#,
                     .cloned()
                     .unwrap_or(Value::Null);
 
-                let result = match self.tools.get(tool_name) {
-                    Some(tool) => tool.execute(&args, &self.ctx),
-                    None => format!("Unknown tool: {tool_name}"),
-                };
+                let result = self.execute_named_tool(tool_name, &args);
 
-                messages.push(json!({
+                tool_results.push(json!({
+                    "role": "tool",
+                    "tool_name": tool_name,
+                    "content": result
+                }));
+            }
+
+            return Ok(StepOutcome::ToolResults(tool_results));
+        }
+
+        if let Some((tool_name, args)) = self.parse_content_tool_call(&assistant_message) {
+            let result = self.execute_named_tool(&tool_name, &args);
+
+            return Ok(StepOutcome::ToolResults(vec![json!({
                 "role": "tool",
                 "tool_name": tool_name,
                 "content": result
-            }));
-            }
+            })]));
+        }
 
-            let _ = self.save_messages(session_id, &messages);
+        let content = assistant_message
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+
+        Ok(StepOutcome::Final(content))
+    }
+
+    fn run(&self, session_id: &str, user_message: &str) -> String {
+        let mut messages = self.load_session(session_id);
+
+        messages.push(json!({
+        "role": "user",
+        "content": user_message
+    }));
+
+        for _ in 0..MAX_ITERATIONS {
+            match self.step(&mut messages) {
+                Ok(StepOutcome::Final(content)) => {
+                    let _ = self.save_messages(session_id, &messages);
+                    return content;
+                }
+                Ok(StepOutcome::ToolResults(tool_messages)) => {
+                    messages.extend(tool_messages);
+                    let _ = self.save_messages(session_id, &messages);
+                }
+                Err(e) => return format!("LLM error: {e}"),
+            }
         }
 
         "Max iterations reached.".to_string()

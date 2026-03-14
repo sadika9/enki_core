@@ -1,4 +1,3 @@
-use crate::tooling::types::*;
 macro_rules! define_tool {
     (
         $tool_type:ty,
@@ -20,16 +19,16 @@ macro_rules! define_tool {
                 $parameters
             }
 
-            fn execute(&self, $args: &Value, $ctx: &ToolContext) -> String $body
+            fn execute(&self, $args: &serde_json::Value, $ctx: &crate::tooling::types::ToolContext) -> String $body
         }
     };
 }
 
 macro_rules! register_tools {
     ($($tool_type:ident),+ $(,)?) => {{
-        let mut registry: ToolRegistry = BTreeMap::new();
+        let mut registry: crate::tooling::types::ToolRegistry = std::collections::BTreeMap::new();
         $(
-            let tool: Box<dyn Tool> = Box::new($tool_type);
+            let tool: Box<dyn crate::tooling::types::Tool> = Box::new($tool_type);
             registry.insert(tool.name().to_string(), tool);
         )+
         registry
