@@ -1,20 +1,24 @@
+mod workspace;
+
+use crate::agent::workspace::AgentWorkspace;
+use crate::llm::{
+    ChatMessage, LlmConfig, LlmProvider, MessageRole, UniversalLLMClient,
+};
+use crate::message::message::{IndexedValue, Message, next_request_id};
 use crate::tooling::tool_calling::{RegistryToolExecutor, ToolCallRegistry, ToolExecutor};
 use crate::tooling::types::ToolContext;
-use crate::{build_context, build_tools, ensure_dirs, post_json};
-use crate::message::message::{IndexedValue, Message, next_request_id};
-use serde_json::{json, Value};
+use crate::build_tools;
+use serde_json::Value;
+use std::path::PathBuf;
 use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 // Config
-const DEFAULT_LLM_URL: &str = "http://localhost:11434/api/chat";
-const DEFAULT_MODEL: &str = "qwen3.5:latest";
 const DEFAULT_MAX_ITERATIONS: usize = 20;
 
 pub struct AgentDefinition {
     pub name: String,
     pub system_prompt_preamble: String,
-    pub llm_url: String,
     pub model: String,
     pub max_iterations: usize,
 }
@@ -24,8 +28,7 @@ impl Default for AgentDefinition {
         Self {
             name: "Personal Assistant".to_string(),
             system_prompt_preamble: "You are a helpful Personal Assistant agent.".to_string(),
-            llm_url: DEFAULT_LLM_URL.to_string(),
-            model: DEFAULT_MODEL.to_string(),
+            model: String::new(),
             max_iterations: DEFAULT_MAX_ITERATIONS,
         }
     }
@@ -35,7 +38,8 @@ pub struct Agent {
     definition: AgentDefinition,
     tool_registry: ToolCallRegistry,
     tool_executor: Box<dyn ToolExecutor>,
-    ctx: ToolContext,
+    workspace: AgentWorkspace,
+    llm: Box<dyn LlmProvider>,
 }
 
 enum StepOutcome {
@@ -50,30 +54,54 @@ struct ToolInvocation {
 }
 
 impl Agent {
+    fn resolve_model(definition: &AgentDefinition) -> Result<String, String> {
+        if !definition.model.trim().is_empty() {
+            return Ok(definition.model.clone());
+        }
+
+        std::env::var("ENKI_MODEL")
+            .map_err(|_| "Missing model. Set AgentDefinition.model or ENKI_MODEL.".to_string())
+    }
+
     pub(crate) async fn new() -> Result<Self, String> {
         Self::with_definition(AgentDefinition::default()).await
     }
 
     pub(crate) async fn with_definition(definition: AgentDefinition) -> Result<Self, String> {
-        Self::with_definition_and_executor(definition, Box::new(RegistryToolExecutor)).await
+        Self::with_definition_executor_and_workspace(
+            definition,
+            Box::new(RegistryToolExecutor),
+            None,
+        )
+        .await
     }
 
     pub(crate) async fn with_definition_and_executor(
         definition: AgentDefinition,
         tool_executor: Box<dyn ToolExecutor>,
     ) -> Result<Self, String> {
-        let ctx = build_context();
-        ensure_dirs(&ctx).await?;
+        Self::with_definition_executor_and_workspace(definition, tool_executor, None).await
+    }
+
+    pub(crate) async fn with_definition_executor_and_workspace(
+        definition: AgentDefinition,
+        tool_executor: Box<dyn ToolExecutor>,
+        workspace_home: Option<PathBuf>,
+    ) -> Result<Self, String> {
+        let model = Self::resolve_model(&definition)?;
+        let workspace = AgentWorkspace::new(&definition.name, workspace_home);
+        workspace.ensure_dirs().await?;
 
         Ok(Self {
+            llm: Box::new(UniversalLLMClient::new(&model).map_err(|e| e.to_string())?),
             definition,
             tool_registry: ToolCallRegistry::new(build_tools()),
             tool_executor,
-            ctx,
+            workspace,
         })
     }
 
-    fn system_prompt(&self) -> String {
+    fn system_prompt(&self, ctx: &ToolContext) -> String {
         format!(
             r#"You are {}.
 {} Use tools via JSON calls when needed.
@@ -88,16 +116,18 @@ impl Agent {
 - If a tool is needed, prefer native tool calls. If native tool calling is unavailable, respond with ONLY {{"tool": "tool_name", "args": {{...}}}}.
 - When done, respond with plain text.
 Available tools: {}
-Workspace: {}"#,
+Agent workspace: {}
+Current task workspace: {}"#,
             self.definition.name,
             self.definition.system_prompt_preamble,
             self.tool_registry.catalog_json(),
-            self.ctx.workspace_dir.display()
+            ctx.agent_dir.display(),
+            ctx.workspace_dir.display()
         )
     }
 
-    async fn load_session(&self, session_id: &str) -> Vec<Message> {
-        let session_file = self.ctx.sessions_dir.join(format!("{session_id}.jsonl"));
+    async fn load_session(&self, session_id: &str, ctx: &ToolContext) -> Vec<Message> {
+        let session_file = self.workspace.session_file(session_id);
 
         if tokio::fs::try_exists(&session_file).await.unwrap_or(false) {
             if let Ok(file) = File::open(&session_file).await {
@@ -121,11 +151,11 @@ Workspace: {}"#,
             }
         }
 
-        vec![Message::system(self.system_prompt())]
+        vec![Message::system(self.system_prompt(ctx))]
     }
 
     async fn save_messages(&self, session_id: &str, messages: &[Message]) -> Result<(), String> {
-        let session_file = self.ctx.sessions_dir.join(format!("{session_id}.jsonl"));
+        let session_file = self.workspace.session_file(session_id);
         let start = messages.len().saturating_sub(10);
 
         let mut file = File::create(&session_file)
@@ -146,18 +176,46 @@ Workspace: {}"#,
         Ok(())
     }
 
-    async fn call_llm(&self, messages: &[Message]) -> Result<Value, String> {
-        let payload = json!({
-            "model": self.definition.model,
-            "messages": messages.iter().map(Value::from).collect::<Vec<_>>(),
-            "stream": false,
-            "tools": self.tool_registry.tools_payload(),
-        });
+    fn to_llm_messages(&self, messages: &[Message]) -> Vec<ChatMessage> {
+        messages
+            .iter()
+            .filter_map(|message| {
+                let value = Value::from(message);
+                let role = match value.get("role").and_then(Value::as_str)? {
+                    "system" => MessageRole::System,
+                    "user" => MessageRole::User,
+                    "assistant" => MessageRole::Assistant,
+                    "tool" => MessageRole::Tool,
+                    _ => return None,
+                };
 
-        let data = post_json(&self.definition.llm_url, &payload, 60).await?;
-        data.get("message")
-            .cloned()
-            .ok_or_else(|| "Missing `message` in LLM response.".to_string())
+                Some(ChatMessage {
+                    role,
+                    content: value
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    tool_call_id: value
+                        .get("tool_call_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                })
+            })
+            .collect()
+    }
+
+    async fn call_llm(&self, messages: &[Message]) -> Result<Value, String> {
+        let response = self
+            .llm
+            .complete(&self.to_llm_messages(messages), &LlmConfig::default())
+            .await
+            .map_err(|e| e.to_string())?;
+
+        Ok(serde_json::json!({
+            "role": "assistant",
+            "content": response.content,
+        }))
     }
 
     fn parse_content_tool_call(&self, assistant_message: &Value) -> Option<(String, Value)> {
@@ -199,7 +257,10 @@ Workspace: {}"#,
                         .and_then(|function| function.get("arguments"))
                         .cloned()
                         .unwrap_or(Value::Null),
-                    call_id: tool_call.get("id").and_then(Value::as_str).map(str::to_string),
+                    call_id: tool_call
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
                 })
                 .collect();
         }
@@ -218,6 +279,7 @@ Workspace: {}"#,
     async fn build_tool_result_messages(
         &self,
         invocations: Vec<ToolInvocation>,
+        ctx: &ToolContext,
         parent_message_id: Option<String>,
     ) -> Vec<Message> {
         let mut messages = Vec::with_capacity(invocations.len());
@@ -229,7 +291,7 @@ Workspace: {}"#,
                     &self.tool_registry,
                     &invocation.name,
                     &invocation.args,
-                    &self.ctx,
+                    ctx,
                     invocation.call_id.as_deref(),
                 )
                 .await;
@@ -239,7 +301,11 @@ Workspace: {}"#,
         messages
     }
 
-    async fn step(&self, messages: &mut Vec<Message>) -> Result<StepOutcome, String> {
+    async fn step(
+        &self,
+        messages: &mut Vec<Message>,
+        ctx: &ToolContext,
+    ) -> Result<StepOutcome, String> {
         let assistant_message = self.call_llm(messages).await?;
         Self::push_out_message(messages, assistant_message.clone());
 
@@ -248,7 +314,7 @@ Workspace: {}"#,
 
         if !invocations.is_empty() {
             let tool_messages = self
-                .build_tool_result_messages(invocations, parent_message_id)
+                .build_tool_result_messages(invocations, ctx, parent_message_id)
                 .await;
             messages.extend(tool_messages);
             return Ok(StepOutcome::Continue);
@@ -264,7 +330,12 @@ Workspace: {}"#,
     }
 
     pub(crate) async fn run(&self, session_id: &str, user_message: &str) -> String {
-        let mut messages = self.load_session(session_id).await;
+        let ctx = self.workspace.tool_context(session_id);
+        if let Err(e) = tokio::fs::create_dir_all(&ctx.workspace_dir).await {
+            return format!("Workspace error: {e}");
+        }
+
+        let mut messages = self.load_session(session_id, &ctx).await;
         let request_id = next_request_id();
         let prev_message_id = messages.last().map(|message| message.message_id.clone());
 
@@ -276,7 +347,7 @@ Workspace: {}"#,
         ));
 
         for _ in 0..self.definition.max_iterations {
-            match self.step(&mut messages).await {
+            match self.step(&mut messages, &ctx).await {
                 Ok(StepOutcome::Continue) => {
                     self.persist(session_id, &messages).await;
                 }

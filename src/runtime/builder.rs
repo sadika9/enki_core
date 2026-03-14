@@ -2,12 +2,14 @@ use crate::agent::{Agent, AgentDefinition};
 use crate::runtime::{Runtime, RuntimeHandler, RuntimeRequest, SessionContext};
 use crate::tooling::tool_calling::ToolExecutor;
 use async_trait::async_trait;
+use std::path::PathBuf;
 
 pub type AgentRuntime = Runtime<AgentRuntimeHandler>;
 
 pub struct RuntimeBuilder {
     definition: AgentDefinition,
     tool_executor: Option<Box<dyn ToolExecutor>>,
+    workspace_home: Option<PathBuf>,
 }
 
 impl RuntimeBuilder {
@@ -15,6 +17,7 @@ impl RuntimeBuilder {
         Self {
             definition,
             tool_executor: None,
+            workspace_home: None,
         }
     }
 
@@ -27,12 +30,34 @@ impl RuntimeBuilder {
         self
     }
 
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.definition.model = model.into();
+        self
+    }
+
+    pub fn with_workspace_home(mut self, workspace_home: impl Into<PathBuf>) -> Self {
+        self.workspace_home = Some(workspace_home.into());
+        self
+    }
+
     pub async fn build(self) -> Result<AgentRuntime, String> {
         let agent = match self.tool_executor {
             Some(tool_executor) => {
-                Agent::with_definition_and_executor(self.definition, tool_executor).await?
+                Agent::with_definition_executor_and_workspace(
+                    self.definition,
+                    tool_executor,
+                    self.workspace_home,
+                )
+                .await?
             }
-            None => Agent::with_definition(self.definition).await?,
+            None => {
+                Agent::with_definition_executor_and_workspace(
+                    self.definition,
+                    Box::new(crate::tooling::tool_calling::RegistryToolExecutor),
+                    self.workspace_home,
+                )
+                .await?
+            }
         };
 
         Ok(Runtime::new(AgentRuntimeHandler { agent }))

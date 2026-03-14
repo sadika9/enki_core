@@ -6,6 +6,7 @@ use std::path::PathBuf;
 pub type ToolRegistry = BTreeMap<String, Box<dyn Tool>>;
 
 pub struct ToolContext {
+    pub agent_dir: PathBuf,
     pub workspace_dir: PathBuf,
     pub sessions_dir: PathBuf,
 }
