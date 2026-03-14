@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -9,11 +10,12 @@ pub struct ToolContext {
     pub sessions_dir: PathBuf,
 }
 
+#[async_trait(?Send)]
 pub trait Tool {
     fn name(&self) -> &'static str;
     fn description(&self) -> &'static str;
     fn parameters(&self) -> Value;
-    fn execute(&self, args: &Value, ctx: &ToolContext) -> String;
+    async fn execute(&self, args: &Value, ctx: &ToolContext) -> String;
 
     fn as_tool_payload(&self) -> Value {
         json!({

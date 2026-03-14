@@ -6,6 +6,7 @@ macro_rules! define_tool {
         parameters: $parameters:expr,
         |$args:ident, $ctx:ident| $body:block
     ) => {
+        #[async_trait::async_trait(?Send)]
         impl Tool for $tool_type {
             fn name(&self) -> &'static str {
                 $name
@@ -19,7 +20,7 @@ macro_rules! define_tool {
                 $parameters
             }
 
-            fn execute(&self, $args: &serde_json::Value, $ctx: &crate::tooling::types::ToolContext) -> String $body
+            async fn execute(&self, $args: &serde_json::Value, $ctx: &crate::tooling::types::ToolContext) -> String $body
         }
     };
 }

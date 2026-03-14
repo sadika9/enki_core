@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use crate::tooling::types::{Tool, ToolContext, ToolRegistry};
 use serde_json::{Value, json};
 
@@ -29,8 +30,9 @@ impl ToolCallRegistry {
     }
 }
 
+#[async_trait(?Send)]
 pub trait ToolExecutor {
-    fn execute(
+    async fn execute(
         &self,
         registry: &ToolCallRegistry,
         tool_name: &str,
@@ -38,7 +40,7 @@ pub trait ToolExecutor {
         ctx: &ToolContext,
     ) -> String;
 
-    fn build_tool_message(
+    async fn build_tool_message(
         &self,
         registry: &ToolCallRegistry,
         tool_name: &str,
@@ -46,7 +48,7 @@ pub trait ToolExecutor {
         ctx: &ToolContext,
         tool_call_id: Option<&str>,
     ) -> Value {
-        let content = self.execute(registry, tool_name, args, ctx);
+        let content = self.execute(registry, tool_name, args, ctx).await;
         let mut message = json!({
             "role": "tool",
             "tool_name": tool_name,
@@ -63,8 +65,9 @@ pub trait ToolExecutor {
 
 pub struct RegistryToolExecutor;
 
+#[async_trait(?Send)]
 impl ToolExecutor for RegistryToolExecutor {
-    fn execute(
+    async fn execute(
         &self,
         registry: &ToolCallRegistry,
         tool_name: &str,
@@ -72,7 +75,7 @@ impl ToolExecutor for RegistryToolExecutor {
         ctx: &ToolContext,
     ) -> String {
         match registry.get(tool_name) {
-            Some(tool) => tool.execute(args, ctx),
+            Some(tool) => tool.execute(args, ctx).await,
             None => format!("Unknown tool: {tool_name}"),
         }
     }

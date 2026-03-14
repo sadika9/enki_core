@@ -8,12 +8,12 @@ use crate::tooling::builtin_tools::{ExecTool, ReadFileTool, WriteFileTool};
 use crate::tooling::types::*;
 
 use crate::agent::Agent;
-use reqwest::blocking::Client;
+use reqwest::Client;
 use serde_json::Value;
 use std::env;
-use std::fs::{self};
 use std::path::PathBuf;
 use std::time::Duration;
+use tokio::fs;
 
 fn api_key() -> Option<String> {
     None
@@ -36,15 +36,17 @@ fn build_context() -> ToolContext {
     }
 }
 
-fn ensure_dirs(ctx: &ToolContext) -> Result<(), String> {
-    fs::create_dir_all(&ctx.sessions_dir).map_err(|e| format!("Failed to create dirs: {e}"))
+async fn ensure_dirs(ctx: &ToolContext) -> Result<(), String> {
+    fs::create_dir_all(&ctx.sessions_dir)
+        .await
+        .map_err(|e| format!("Failed to create dirs: {e}"))
 }
 
 fn build_tools() -> ToolRegistry {
     register_tools![ReadFileTool, WriteFileTool, ExecTool]
 }
 
-fn post_json(url: &str, payload: &Value, timeout_secs: u64) -> Result<Value, String> {
+async fn post_json(url: &str, payload: &Value, timeout_secs: u64) -> Result<Value, String> {
     let client = Client::builder()
         .timeout(Duration::from_secs(timeout_secs))
         .build()
@@ -56,9 +58,9 @@ fn post_json(url: &str, payload: &Value, timeout_secs: u64) -> Result<Value, Str
         req = req.bearer_auth(key);
     }
 
-    let resp = req.send().map_err(|e| format!("Connection error: {e}"))?;
+    let resp = req.send().await.map_err(|e| format!("Connection error: {e}"))?;
     let status = resp.status();
-    let body = resp.text().map_err(|e| format!("Read error: {e}"))?;
+    let body = resp.text().await.map_err(|e| format!("Read error: {e}"))?;
 
     if !status.is_success() {
         return Err(format!("HTTP {}: {}", status.as_u16(), body));
@@ -68,8 +70,9 @@ fn post_json(url: &str, payload: &Value, timeout_secs: u64) -> Result<Value, Str
 }
 
 
-fn main() {
-    let agent = match Agent::new() {
+#[tokio::main]
+async fn main() {
+    let agent = match Agent::new().await {
         Ok(agent) => agent,
         Err(e) => {
             eprintln!("{e}");
@@ -87,6 +90,6 @@ fn main() {
     let session_id = &args[1];
     let message = args[2..].join(" ");
 
-    let response = agent.run(session_id, &message);
+    let response = agent.run(session_id, &message).await;
     println!("{response}");
 }

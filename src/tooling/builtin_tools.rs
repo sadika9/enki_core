@@ -1,8 +1,8 @@
 use crate::tooling::types::*;
 use serde_json::{Value, json};
-use std::fs;
 use std::path::Path;
-use std::process::Command;
+use tokio::fs;
+use tokio::process::Command;
 
 pub struct ReadFileTool;
 pub struct WriteFileTool;
@@ -25,7 +25,7 @@ define_tool!(
             .and_then(Value::as_str)
             .unwrap_or_default();
 
-        match fs::read_to_string(Path::new(path)) {
+        match fs::read_to_string(Path::new(path)).await {
             Ok(content) => content,
             Err(_) => "File not found.".to_string(),
         }
@@ -55,7 +55,7 @@ define_tool!(
             .and_then(Value::as_str)
             .unwrap_or_default();
 
-        match fs::write(Path::new(path), content) {
+        match fs::write(Path::new(path), content).await {
             Ok(_) => "File written.".to_string(),
             Err(e) => format!("Error: {e}"),
         }
@@ -84,6 +84,7 @@ define_tool!(
             .arg(cmd)
             .current_dir(&ctx.workspace_dir)
             .output()
+            .await
         {
             Ok(result) => {
                 let stdout = String::from_utf8_lossy(&result.stdout);

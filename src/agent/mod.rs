@@ -3,9 +3,8 @@ use crate::tooling::types::ToolContext;
 use crate::{build_context, build_tools, ensure_dirs, post_json};
 use crate::message::message::{IndexedValue, Message, next_request_id};
 use serde_json::{json, Value};
-use std::fs::File;
-use std::io::Write;
-use std::io::{BufRead, BufReader};
+use tokio::fs::File;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 // Config
 const DEFAULT_LLM_URL: &str = "http://localhost:11434/api/chat";
@@ -51,20 +50,20 @@ struct ToolInvocation {
 }
 
 impl Agent {
-    pub(crate) fn new() -> Result<Self, String> {
-        Self::with_definition(AgentDefinition::default())
+    pub(crate) async fn new() -> Result<Self, String> {
+        Self::with_definition(AgentDefinition::default()).await
     }
 
-    pub(crate) fn with_definition(definition: AgentDefinition) -> Result<Self, String> {
-        Self::with_definition_and_executor(definition, Box::new(RegistryToolExecutor))
+    pub(crate) async fn with_definition(definition: AgentDefinition) -> Result<Self, String> {
+        Self::with_definition_and_executor(definition, Box::new(RegistryToolExecutor)).await
     }
 
-    pub(crate) fn with_definition_and_executor(
+    pub(crate) async fn with_definition_and_executor(
         definition: AgentDefinition,
         tool_executor: Box<dyn ToolExecutor>,
     ) -> Result<Self, String> {
         let ctx = build_context();
-        ensure_dirs(&ctx)?;
+        ensure_dirs(&ctx).await?;
 
         Ok(Self {
             definition,
@@ -97,25 +96,24 @@ Workspace: {}"#,
         )
     }
 
-    fn load_session(&self, session_id: &str) -> Vec<Message> {
+    async fn load_session(&self, session_id: &str) -> Vec<Message> {
         let session_file = self.ctx.sessions_dir.join(format!("{session_id}.jsonl"));
 
-        if session_file.exists() {
-            if let Ok(file) = File::open(&session_file) {
+        if tokio::fs::try_exists(&session_file).await.unwrap_or(false) {
+            if let Ok(file) = File::open(&session_file).await {
                 let reader = BufReader::new(file);
-                let messages: Vec<Message> = reader
-                    .lines()
-                    .enumerate()
-                    .filter_map(|(index, line)| {
-                        line.ok().and_then(|line| {
-                            serde_json::from_str::<Value>(&line)
-                                .ok()
-                                .and_then(|value| {
-                                    Message::try_from(IndexedValue { index, value }).ok()
-                                })
-                        })
-                    })
-                    .collect();
+                let mut lines = reader.lines();
+                let mut messages = Vec::new();
+                let mut index = 0usize;
+
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if let Ok(value) = serde_json::from_str::<Value>(&line) {
+                        if let Ok(message) = Message::try_from(IndexedValue { index, value }) {
+                            messages.push(message);
+                        }
+                    }
+                    index += 1;
+                }
 
                 if !messages.is_empty() {
                     return messages;
@@ -126,23 +124,29 @@ Workspace: {}"#,
         vec![Message::system(self.system_prompt())]
     }
 
-    fn save_messages(&self, session_id: &str, messages: &[Message]) -> Result<(), String> {
+    async fn save_messages(&self, session_id: &str, messages: &[Message]) -> Result<(), String> {
         let session_file = self.ctx.sessions_dir.join(format!("{session_id}.jsonl"));
         let start = messages.len().saturating_sub(10);
 
         let mut file = File::create(&session_file)
+            .await
             .map_err(|e| format!("Failed to open session file for writing: {e}"))?;
 
         for msg in &messages[start..] {
             let line = serde_json::to_string(&Value::from(msg.clone()))
                 .map_err(|e| format!("Failed to serialize message: {e}"))?;
-            writeln!(file, "{line}").map_err(|e| format!("Failed to write session file: {e}"))?;
+            file.write_all(line.as_bytes())
+                .await
+                .map_err(|e| format!("Failed to write session file: {e}"))?;
+            file.write_all(b"\n")
+                .await
+                .map_err(|e| format!("Failed to write session file: {e}"))?;
         }
 
         Ok(())
     }
 
-    fn call_llm(&self, messages: &[Message]) -> Result<Value, String> {
+    async fn call_llm(&self, messages: &[Message]) -> Result<Value, String> {
         let payload = json!({
             "model": self.definition.model,
             "messages": messages.iter().map(Value::from).collect::<Vec<_>>(),
@@ -150,7 +154,7 @@ Workspace: {}"#,
             "tools": self.tool_registry.tools_payload(),
         });
 
-        let data = post_json(&self.definition.llm_url, &payload, 60)?;
+        let data = post_json(&self.definition.llm_url, &payload, 60).await?;
         data.get("message")
             .cloned()
             .ok_or_else(|| "Missing `message` in LLM response.".to_string())
@@ -164,8 +168,8 @@ Workspace: {}"#,
         Some((tool_name, args))
     }
 
-    fn persist(&self, session_id: &str, messages: &[Message]) {
-        let _ = self.save_messages(session_id, messages);
+    async fn persist(&self, session_id: &str, messages: &[Message]) {
+        let _ = self.save_messages(session_id, messages).await;
     }
 
     fn push_out_message(messages: &mut Vec<Message>, value: Value) {
@@ -211,37 +215,41 @@ Workspace: {}"#,
             .unwrap_or_default()
     }
 
-    fn build_tool_result_messages(
+    async fn build_tool_result_messages(
         &self,
         invocations: Vec<ToolInvocation>,
         parent_message_id: Option<String>,
     ) -> Vec<Message> {
-        invocations
-            .into_iter()
-            .map(|invocation| {
-                Message::out(
-                    self.tool_executor.build_tool_message(
-                        &self.tool_registry,
-                        &invocation.name,
-                        &invocation.args,
-                        &self.ctx,
-                        invocation.call_id.as_deref(),
-                    ),
-                    parent_message_id.clone(),
+        let mut messages = Vec::with_capacity(invocations.len());
+
+        for invocation in invocations {
+            let tool_message = self
+                .tool_executor
+                .build_tool_message(
+                    &self.tool_registry,
+                    &invocation.name,
+                    &invocation.args,
+                    &self.ctx,
+                    invocation.call_id.as_deref(),
                 )
-            })
-            .collect()
+                .await;
+            messages.push(Message::out(tool_message, parent_message_id.clone()));
+        }
+
+        messages
     }
 
-    fn step(&self, messages: &mut Vec<Message>) -> Result<StepOutcome, String> {
-        let assistant_message = self.call_llm(messages)?;
+    async fn step(&self, messages: &mut Vec<Message>) -> Result<StepOutcome, String> {
+        let assistant_message = self.call_llm(messages).await?;
         Self::push_out_message(messages, assistant_message.clone());
 
         let parent_message_id = messages.last().map(|message| message.message_id.clone());
         let invocations = self.extract_tool_invocations(&assistant_message);
 
         if !invocations.is_empty() {
-            let tool_messages = self.build_tool_result_messages(invocations, parent_message_id);
+            let tool_messages = self
+                .build_tool_result_messages(invocations, parent_message_id)
+                .await;
             messages.extend(tool_messages);
             return Ok(StepOutcome::Continue);
         }
@@ -255,8 +263,8 @@ Workspace: {}"#,
         Ok(StepOutcome::Final(content))
     }
 
-    pub(crate) fn run(&self, session_id: &str, user_message: &str) -> String {
-        let mut messages = self.load_session(session_id);
+    pub(crate) async fn run(&self, session_id: &str, user_message: &str) -> String {
+        let mut messages = self.load_session(session_id).await;
         let request_id = next_request_id();
         let prev_message_id = messages.last().map(|message| message.message_id.clone());
 
@@ -268,19 +276,19 @@ Workspace: {}"#,
         ));
 
         for _ in 0..self.definition.max_iterations {
-            match self.step(&mut messages) {
+            match self.step(&mut messages).await {
                 Ok(StepOutcome::Continue) => {
-                    self.persist(session_id, &messages);
+                    self.persist(session_id, &messages).await;
                 }
                 Ok(StepOutcome::Final(content)) => {
-                    self.persist(session_id, &messages);
+                    self.persist(session_id, &messages).await;
                     return content;
                 }
                 Err(e) => return format!("LLM error: {e}"),
             }
         }
 
-        self.persist(session_id, &messages);
+        self.persist(session_id, &messages).await;
         "Max iterations reached.".to_string()
     }
 }
