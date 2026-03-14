@@ -2,7 +2,7 @@ mod workspace;
 
 use crate::agent::workspace::AgentWorkspace;
 use crate::llm::{
-    ChatMessage, LlmConfig, LlmProvider, MessageRole, UniversalLLMClient,
+    ChatMessage, LlmConfig, LlmProvider, MessageRole, ToolDefinition, UniversalLLMClient,
 };
 use crate::message::message::{IndexedValue, Message, next_request_id};
 use crate::tooling::tool_calling::{RegistryToolExecutor, ToolCallRegistry, ToolExecutor};
@@ -228,25 +228,130 @@ Current task workspace: {}"#,
             .collect()
     }
 
+    fn tool_definitions(&self) -> Vec<ToolDefinition> {
+        self.tool_registry
+            .catalog_json()
+            .as_object()
+            .map(|tools| {
+                tools.iter()
+                    .map(|(name, entry)| ToolDefinition {
+                        name: name.clone(),
+                        description: entry
+                            .get("description")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn decode_tool_calls(&self, tool_calls: Vec<String>) -> Vec<Value> {
+        tool_calls
+            .into_iter()
+            .filter_map(|tool_call| serde_json::from_str::<Value>(&tool_call).ok())
+            .collect()
+    }
+
     async fn call_llm(&self, messages: &[Message]) -> Result<Value, String> {
+        let tool_definitions = self.tool_definitions();
         let response = self
             .llm
-            .complete(&self.to_llm_messages(messages), &LlmConfig::default())
+            .complete_with_tools(
+                &self.to_llm_messages(messages),
+                &tool_definitions,
+                &LlmConfig::default(),
+            )
             .await
             .map_err(|e| e.to_string())?;
 
-        Ok(serde_json::json!({
+        let mut assistant_message = serde_json::json!({
             "role": "assistant",
             "content": response.content,
-        }))
+        });
+
+        let tool_calls = self.decode_tool_calls(response.tool_calls);
+        if !tool_calls.is_empty() {
+            assistant_message["tool_calls"] = Value::Array(tool_calls);
+        }
+
+        Ok(assistant_message)
     }
 
     fn parse_content_tool_call(&self, assistant_message: &Value) -> Option<(String, Value)> {
         let content = assistant_message.get("content")?.as_str()?;
-        let parsed: Value = serde_json::from_str(content).ok()?;
+        Self::extract_embedded_tool_call(content)
+    }
+
+    fn extract_embedded_tool_call(content: &str) -> Option<(String, Value)> {
+        if let Some(tool_call) = Self::parse_tool_call_value(content) {
+            return Some(tool_call);
+        }
+
+        for candidate in Self::json_object_candidates(content) {
+            if let Some(tool_call) = Self::parse_tool_call_value(candidate) {
+                return Some(tool_call);
+            }
+        }
+
+        None
+    }
+
+    fn parse_tool_call_value(raw: &str) -> Option<(String, Value)> {
+        let parsed: Value = serde_json::from_str(raw).ok()?;
         let tool_name = parsed.get("tool")?.as_str()?.to_string();
         let args = parsed.get("args").cloned().unwrap_or(Value::Null);
         Some((tool_name, args))
+    }
+
+    fn json_object_candidates(content: &str) -> Vec<&str> {
+        let mut candidates = Vec::new();
+        let mut start = None;
+        let mut depth = 0usize;
+        let mut in_string = false;
+        let mut escaped = false;
+
+        for (idx, ch) in content.char_indices() {
+            if in_string {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+
+                match ch {
+                    '\\' => escaped = true,
+                    '"' => in_string = false,
+                    _ => {}
+                }
+
+                continue;
+            }
+
+            match ch {
+                '"' => in_string = true,
+                '{' => {
+                    if depth == 0 {
+                        start = Some(idx);
+                    }
+                    depth += 1;
+                }
+                '}' => {
+                    if depth == 0 {
+                        continue;
+                    }
+
+                    depth -= 1;
+                    if depth == 0 {
+                        if let Some(start_idx) = start.take() {
+                            candidates.push(&content[start_idx..=idx]);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        candidates
     }
 
     async fn persist(&self, session_id: &str, messages: &[Message]) {
@@ -384,5 +489,51 @@ Current task workspace: {}"#,
 
         self.persist(session_id, &messages).await;
         "Max iterations reached.".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Agent;
+    use serde_json::json;
+
+    #[test]
+    fn extracts_tool_call_from_mixed_content() {
+        let assistant_message = json!({
+            "role": "assistant",
+            "content": "I'll save the note for you.\n\n{\"tool\":\"write_file\",\"args\":{\"path\":\"note.md\",\"content\":\"hello\"}}\n\nDone."
+        });
+
+        let tool_call = Agent::extract_embedded_tool_call(
+            assistant_message["content"].as_str().unwrap(),
+        );
+
+        assert_eq!(
+            tool_call,
+            Some((
+                "write_file".to_string(),
+                json!({
+                    "path": "note.md",
+                    "content": "hello"
+                })
+            ))
+        );
+    }
+
+    #[test]
+    fn ignores_non_tool_json_objects() {
+        let content = "Summary: {\"ok\":true}\n{\"tool\":\"exec\",\"args\":{\"cmd\":\"pwd\"}}";
+
+        let tool_call = Agent::extract_embedded_tool_call(content);
+
+        assert_eq!(
+            tool_call,
+            Some((
+                "exec".to_string(),
+                json!({
+                    "cmd": "pwd"
+                })
+            ))
+        );
     }
 }

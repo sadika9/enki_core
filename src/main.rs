@@ -26,7 +26,7 @@ async fn main() {
                 std::process::exit(1);
             }
         }))
-        .with_workspace_home("./")
+        .with_workspace_home("./ps")
         .build()
         .await
     {
