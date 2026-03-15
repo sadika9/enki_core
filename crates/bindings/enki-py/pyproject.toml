@@ -1,0 +1,22 @@
+[build-system]
+requires = ["maturin>=1.12,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "enki-py"
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: Implementation :: PyPy",
+]
+dynamic = ["version"]
+dependencies = [
+    "uniffi-bindgen>=0.31.0",
+]
+[project.optional-dependencies]
+tests = [
+    "pytest",
+]
+[tool.maturin]
+python-source = "python"
