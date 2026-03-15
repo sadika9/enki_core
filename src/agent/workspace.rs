@@ -5,6 +5,7 @@ use tokio::fs;
 
 pub struct AgentWorkspace {
     pub agent_dir: PathBuf,
+    pub memory_dir: PathBuf,
     pub sessions_dir: PathBuf,
     pub tasks_dir: PathBuf,
 }
@@ -16,17 +17,22 @@ impl AgentWorkspace {
             .join(".atomiagent")
             .join("agents");
         let agent_dir = root_dir.join(slugify(agent_name));
+        let memory_dir = agent_dir.join("memory");
         let sessions_dir = agent_dir.join("sessions");
         let tasks_dir = agent_dir.join("tasks");
 
         Self {
             agent_dir,
+            memory_dir,
             sessions_dir,
             tasks_dir,
         }
     }
 
     pub async fn ensure_dirs(&self) -> Result<(), String> {
+        fs::create_dir_all(&self.memory_dir)
+            .await
+            .map_err(|e| format!("Failed to create memory workspace: {e}"))?;
         fs::create_dir_all(&self.sessions_dir)
             .await
             .map_err(|e| format!("Failed to create session workspace: {e}"))?;
@@ -34,10 +40,6 @@ impl AgentWorkspace {
             .await
             .map_err(|e| format!("Failed to create task workspace: {e}"))?;
         Ok(())
-    }
-
-    pub fn session_file(&self, session_id: &str) -> PathBuf {
-        self.sessions_dir.join(format!("{}.jsonl", slugify(session_id)))
     }
 
     pub fn task_dir(&self, session_id: &str) -> PathBuf {

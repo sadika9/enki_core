@@ -1,5 +1,6 @@
 use crate::agent::{Agent, AgentDefinition};
 use crate::llm::LlmProvider;
+use crate::memory::MemoryManager;
 use crate::runtime::{Runtime, RuntimeHandler, RuntimeRequest, SessionContext};
 use crate::tooling::tool_calling::ToolExecutor;
 use async_trait::async_trait;
@@ -10,6 +11,7 @@ pub type AgentRuntime = Runtime<AgentRuntimeHandler>;
 pub struct RuntimeBuilder {
     definition: AgentDefinition,
     llm: Option<Box<dyn LlmProvider>>,
+    memory: Option<MemoryManager>,
     tool_executor: Option<Box<dyn ToolExecutor>>,
     workspace_home: Option<PathBuf>,
 }
@@ -19,6 +21,7 @@ impl RuntimeBuilder {
         Self {
             definition,
             llm: None,
+            memory: None,
             tool_executor: None,
             workspace_home: None,
         }
@@ -43,6 +46,11 @@ impl RuntimeBuilder {
         self
     }
 
+    pub fn with_memory(mut self, memory: MemoryManager) -> Self {
+        self.memory = Some(memory);
+        self
+    }
+
     pub fn with_workspace_home(mut self, workspace_home: impl Into<PathBuf>) -> Self {
         self.workspace_home = Some(workspace_home.into());
         self
@@ -52,6 +60,7 @@ impl RuntimeBuilder {
         let RuntimeBuilder {
             definition,
             llm,
+            memory,
             tool_executor,
             workspace_home,
         } = self;
@@ -62,6 +71,7 @@ impl RuntimeBuilder {
             definition,
             tool_executor,
             llm,
+            memory,
             workspace_home,
         )
         .await?;

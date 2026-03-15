@@ -4,14 +4,13 @@ use crate::agent::workspace::AgentWorkspace;
 use crate::llm::{
     ChatMessage, LlmConfig, LlmProvider, MessageRole, ToolDefinition, UniversalLLMClient,
 };
-use crate::message::message::{IndexedValue, Message, next_request_id};
+use crate::memory::MemoryManager;
+use crate::message::message::{Message, next_request_id};
 use crate::tooling::tool_calling::{RegistryToolExecutor, ToolCallRegistry, ToolExecutor};
 use crate::tooling::types::ToolContext;
 use crate::build_tools;
 use serde_json::Value;
 use std::path::PathBuf;
-use tokio::fs::File;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 // Config
 const DEFAULT_MAX_ITERATIONS: usize = 20;
@@ -40,6 +39,7 @@ pub struct Agent {
     tool_executor: Box<dyn ToolExecutor>,
     workspace: AgentWorkspace,
     llm: Box<dyn LlmProvider>,
+    memory: MemoryManager,
 }
 
 enum StepOutcome {
@@ -73,6 +73,7 @@ impl Agent {
             Box::new(RegistryToolExecutor),
             None,
             None,
+            None,
         )
         .await
     }
@@ -81,8 +82,14 @@ impl Agent {
         definition: AgentDefinition,
         tool_executor: Box<dyn ToolExecutor>,
     ) -> Result<Self, String> {
-        Self::with_definition_executor_llm_and_workspace(definition, tool_executor, None, None)
-            .await
+        Self::with_definition_executor_llm_and_workspace(
+            definition,
+            tool_executor,
+            None,
+            None,
+            None,
+        )
+        .await
     }
 
     pub(crate) async fn with_definition_executor_and_workspace(
@@ -94,6 +101,7 @@ impl Agent {
             definition,
             tool_executor,
             None,
+            None,
             workspace_home,
         )
         .await
@@ -103,6 +111,7 @@ impl Agent {
         definition: AgentDefinition,
         tool_executor: Box<dyn ToolExecutor>,
         llm: Option<Box<dyn LlmProvider>>,
+        memory: Option<MemoryManager>,
         workspace_home: Option<PathBuf>,
     ) -> Result<Self, String> {
         let workspace = AgentWorkspace::new(&definition.name, workspace_home);
@@ -117,6 +126,7 @@ impl Agent {
 
         Ok(Self {
             llm,
+            memory: memory.unwrap_or_else(|| MemoryManager::with_defaults(workspace.memory_dir.clone())),
             definition,
             tool_registry: ToolCallRegistry::new(build_tools()),
             tool_executor,
@@ -124,8 +134,8 @@ impl Agent {
         })
     }
 
-    fn system_prompt(&self, ctx: &ToolContext) -> String {
-        format!(
+    fn system_prompt(&self, ctx: &ToolContext, memory_context: &str) -> String {
+        let mut prompt = format!(
             r#"You are {}.
 {} Use tools via JSON calls when needed.
 - Process each incoming user message as a loop:
@@ -146,57 +156,14 @@ Current task workspace: {}"#,
             self.tool_registry.catalog_json(),
             ctx.agent_dir.display(),
             ctx.workspace_dir.display()
-        )
-    }
+        );
 
-    async fn load_session(&self, session_id: &str, ctx: &ToolContext) -> Vec<Message> {
-        let session_file = self.workspace.session_file(session_id);
-
-        if tokio::fs::try_exists(&session_file).await.unwrap_or(false) {
-            if let Ok(file) = File::open(&session_file).await {
-                let reader = BufReader::new(file);
-                let mut lines = reader.lines();
-                let mut messages = Vec::new();
-                let mut index = 0usize;
-
-                while let Ok(Some(line)) = lines.next_line().await {
-                    if let Ok(value) = serde_json::from_str::<Value>(&line) {
-                        if let Ok(message) = Message::try_from(IndexedValue { index, value }) {
-                            messages.push(message);
-                        }
-                    }
-                    index += 1;
-                }
-
-                if !messages.is_empty() {
-                    return messages;
-                }
-            }
+        if !memory_context.trim().is_empty() {
+            prompt.push_str("\n\n");
+            prompt.push_str(memory_context);
         }
 
-        vec![Message::system(self.system_prompt(ctx))]
-    }
-
-    async fn save_messages(&self, session_id: &str, messages: &[Message]) -> Result<(), String> {
-        let session_file = self.workspace.session_file(session_id);
-        let start = messages.len().saturating_sub(10);
-
-        let mut file = File::create(&session_file)
-            .await
-            .map_err(|e| format!("Failed to open session file for writing: {e}"))?;
-
-        for msg in &messages[start..] {
-            let line = serde_json::to_string(&Value::from(msg.clone()))
-                .map_err(|e| format!("Failed to serialize message: {e}"))?;
-            file.write_all(line.as_bytes())
-                .await
-                .map_err(|e| format!("Failed to write session file: {e}"))?;
-            file.write_all(b"\n")
-                .await
-                .map_err(|e| format!("Failed to write session file: {e}"))?;
-        }
-
-        Ok(())
+        prompt
     }
 
     fn to_llm_messages(&self, messages: &[Message]) -> Vec<ChatMessage> {
@@ -354,8 +321,8 @@ Current task workspace: {}"#,
         candidates
     }
 
-    async fn persist(&self, session_id: &str, messages: &[Message]) {
-        let _ = self.save_messages(session_id, messages).await;
+    async fn persist(&self, session_id: &str) {
+        let _ = self.memory.flush_all(session_id).await;
     }
 
     fn push_out_message(messages: &mut Vec<Message>, value: Value) {
@@ -463,7 +430,12 @@ Current task workspace: {}"#,
             return format!("Workspace error: {e}");
         }
 
-        let mut messages = self.load_session(session_id, &ctx).await;
+        let memory_context = self
+            .memory
+            .build_context(session_id, user_message)
+            .await
+            .unwrap_or_default();
+        let mut messages = vec![Message::system(self.system_prompt(&ctx, &memory_context))];
         let request_id = next_request_id();
         let prev_message_id = messages.last().map(|message| message.message_id.clone());
 
@@ -476,19 +448,22 @@ Current task workspace: {}"#,
 
         for _ in 0..self.definition.max_iterations {
             match self.step(&mut messages, &ctx).await {
-                Ok(StepOutcome::Continue) => {
-                    self.persist(session_id, &messages).await;
-                }
+                Ok(StepOutcome::Continue) => {}
                 Ok(StepOutcome::Final(content)) => {
-                    self.persist(session_id, &messages).await;
+                    let _ = self.memory.record_all(session_id, user_message, &content).await;
+                    let _ = self.memory.consolidate_all(session_id).await;
+                    self.persist(session_id).await;
                     return content;
                 }
                 Err(e) => return format!("LLM error: {e}"),
             }
         }
 
-        self.persist(session_id, &messages).await;
-        "Max iterations reached.".to_string()
+        let content = "Max iterations reached.".to_string();
+        let _ = self.memory.record_all(session_id, user_message, &content).await;
+        let _ = self.memory.consolidate_all(session_id).await;
+        self.persist(session_id).await;
+        content
     }
 }
 
