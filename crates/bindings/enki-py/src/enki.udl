@@ -13,7 +13,14 @@ callback interface EnkiToolHandler {
 
 interface EnkiAgent {
   [Name=new]
-  constructor(string name, string system_prompt_preamble, string model, u32 max_iterations, string? workspace_home);
+  constructor(
+    string name,
+    string system_prompt_preamble,
+    string model,
+    u32 max_iterations,
+    string? workspace_home,
+    boolean include_builtin_tools
+  );
 
   [Name=with_tools]
   constructor(

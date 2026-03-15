@@ -1,7 +1,6 @@
 mod workspace;
 
 use crate::agent::workspace::AgentWorkspace;
-use crate::default_tool_registry;
 use crate::llm::{
     ChatMessage, LlmConfig, LlmProvider, MessageRole, ToolDefinition, UniversalLLMClient,
 };
@@ -70,7 +69,7 @@ impl Agent {
     pub async fn with_definition(definition: AgentDefinition) -> Result<Self, String> {
         Self::with_definition_tool_registry_executor_llm_and_workspace(
             definition,
-            default_tool_registry(),
+            ToolRegistry::new(),
             Box::new(RegistryToolExecutor),
             None,
             None,
@@ -85,8 +84,23 @@ impl Agent {
     ) -> Result<Self, String> {
         Self::with_definition_tool_registry_executor_llm_and_workspace(
             definition,
-            default_tool_registry(),
+            ToolRegistry::new(),
             tool_executor,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    pub async fn with_definition_and_tool_registry(
+        definition: AgentDefinition,
+        tool_registry: ToolRegistry,
+    ) -> Result<Self, String> {
+        Self::with_definition_tool_registry_executor_llm_and_workspace(
+            definition,
+            tool_registry,
+            Box::new(RegistryToolExecutor),
             None,
             None,
             None,
@@ -101,7 +115,7 @@ impl Agent {
     ) -> Result<Self, String> {
         Self::with_definition_tool_registry_executor_llm_and_workspace(
             definition,
-            default_tool_registry(),
+            ToolRegistry::new(),
             tool_executor,
             None,
             None,
@@ -136,7 +150,7 @@ impl Agent {
     ) -> Result<Self, String> {
         Self::with_definition_tool_registry_executor_llm_and_workspace(
             definition,
-            default_tool_registry(),
+            ToolRegistry::new(),
             tool_executor,
             llm,
             memory,
@@ -670,6 +684,7 @@ Current task workspace: {}
 mod tests {
     use super::Agent;
     use crate::agent::AgentDefinition;
+    use crate::default_tool_registry;
     use crate::llm::{
         ChatMessage, LlmConfig, LlmError, LlmProvider, LlmResponse, Result as LlmResult,
         ToolDefinition,
@@ -686,6 +701,7 @@ mod tests {
     struct RecordingLlm {
         responses: Arc<Mutex<VecDeque<LlmResponse>>>,
         calls: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
+        tool_calls: Arc<Mutex<Vec<Vec<ToolDefinition>>>>,
     }
 
     impl RecordingLlm {
@@ -693,11 +709,16 @@ mod tests {
             Self {
                 responses: Arc::new(Mutex::new(responses.into())),
                 calls: Arc::new(Mutex::new(Vec::new())),
+                tool_calls: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
         fn calls(&self) -> Vec<Vec<ChatMessage>> {
             self.calls.lock().unwrap().clone()
+        }
+
+        fn requested_tools(&self) -> Vec<Vec<ToolDefinition>> {
+            self.tool_calls.lock().unwrap().clone()
         }
     }
 
@@ -722,10 +743,11 @@ mod tests {
         async fn complete_with_tools(
             &self,
             messages: &[ChatMessage],
-            _tools: &[ToolDefinition],
+            tools: &[ToolDefinition],
             _config: &LlmConfig,
         ) -> LlmResult<LlmResponse> {
             self.calls.lock().unwrap().push(messages.to_vec());
+            self.tool_calls.lock().unwrap().push(tools.to_vec());
             self.responses
                 .lock()
                 .unwrap()
@@ -905,5 +927,69 @@ mod tests {
             last["payload"]["content"].as_str().unwrap(),
             "LLM error: Provider error: missing response"
         );
+    }
+
+    #[tokio::test]
+    async fn does_not_expose_builtin_tools_by_default() {
+        let home = temp_home("no-builtin-tools");
+        let llm = RecordingLlm::new(vec![LlmResponse {
+            content: "No tools".to_string(),
+            usage: None,
+            tool_calls: Vec::new(),
+            model: "recording".to_string(),
+            finish_reason: Some("stop".to_string()),
+        }]);
+
+        let agent = Agent::with_definition_executor_llm_and_workspace(
+            AgentDefinition::default(),
+            Box::new(crate::tooling::tool_calling::RegistryToolExecutor),
+            Some(Box::new(llm.clone())),
+            None,
+            Some(home),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(agent.run("session-a", "hello").await, "No tools");
+
+        let requested_tools = llm.requested_tools();
+        assert_eq!(requested_tools.len(), 1);
+        assert!(requested_tools[0].is_empty());
+    }
+
+    #[tokio::test]
+    async fn exposes_builtin_tools_only_when_added_during_creation() {
+        let home = temp_home("builtin-tools");
+        let llm = RecordingLlm::new(vec![LlmResponse {
+            content: "Builtin tools enabled".to_string(),
+            usage: None,
+            tool_calls: Vec::new(),
+            model: "recording".to_string(),
+            finish_reason: Some("stop".to_string()),
+        }]);
+
+        let agent = Agent::with_definition_tool_registry_executor_llm_and_workspace(
+            AgentDefinition::default(),
+            default_tool_registry(),
+            Box::new(crate::tooling::tool_calling::RegistryToolExecutor),
+            Some(Box::new(llm.clone())),
+            None,
+            Some(home),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            agent.run("session-a", "hello").await,
+            "Builtin tools enabled"
+        );
+
+        let requested_tools = llm.requested_tools();
+        assert_eq!(requested_tools.len(), 1);
+        let tool_names = requested_tools[0]
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(tool_names, vec!["exec", "read_file", "write_file"]);
     }
 }

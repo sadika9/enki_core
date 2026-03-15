@@ -106,6 +106,7 @@ impl EnkiAgent {
         model: String,
         max_iterations: u32,
         workspace_home: Option<String>,
+        include_builtin_tools: bool,
     ) -> Self {
         Self::from_registry(
             AgentDefinition {
@@ -115,6 +116,7 @@ impl EnkiAgent {
                 max_iterations: max_iterations as usize,
             },
             workspace_home,
+            include_builtin_tools,
         )
     }
 
@@ -135,12 +137,19 @@ impl EnkiAgent {
             max_iterations: max_iterations as usize,
         };
 
-        Self::from_custom_tools(definition, workspace_home, tools, handler, include_builtin_tools)
+        Self::from_custom_tools(
+            definition,
+            workspace_home,
+            tools,
+            handler,
+            include_builtin_tools,
+        )
     }
 
     fn from_registry(
         definition: AgentDefinition,
         workspace_home: Option<String>,
+        include_builtin_tools: bool,
     ) -> Self {
         let workspace_home = workspace_home.map(PathBuf::from);
         let (request_tx, request_rx) = mpsc::channel::<RunRequest>();
@@ -161,26 +170,30 @@ impl EnkiAgent {
                 }
             };
 
-            let agent = match runtime.block_on(
-                Agent::with_definition_tool_registry_executor_and_workspace(
+            let agent =
+                match runtime.block_on(Agent::with_definition_tool_registry_executor_and_workspace(
                     definition,
-                    default_tool_registry(),
+                    if include_builtin_tools {
+                        default_tool_registry()
+                    } else {
+                        ToolRegistry::new()
+                    },
                     Box::new(RegistryToolExecutor),
                     workspace_home,
-                ),
-            ) {
-                Ok(agent) => agent,
-                Err(error) => {
-                    let message = format!("Initialization error: {error}");
-                    for request in request_rx {
-                        let _ = request.reply_tx.send(message.clone());
+                )) {
+                    Ok(agent) => agent,
+                    Err(error) => {
+                        let message = format!("Initialization error: {error}");
+                        for request in request_rx {
+                            let _ = request.reply_tx.send(message.clone());
+                        }
+                        return;
                     }
-                    return;
-                }
-            };
+                };
 
             for request in request_rx {
-                let response = runtime.block_on(agent.run(&request.session_id, &request.user_message));
+                let response =
+                    runtime.block_on(agent.run(&request.session_id, &request.user_message));
                 let _ = request.reply_tx.send(response);
             }
         });
@@ -228,26 +241,26 @@ impl EnkiAgent {
                     }
                 };
 
-            let agent = match runtime.block_on(
-                Agent::with_definition_tool_registry_executor_and_workspace(
+            let agent =
+                match runtime.block_on(Agent::with_definition_tool_registry_executor_and_workspace(
                     definition,
                     tool_registry,
                     Box::new(RegistryToolExecutor),
                     workspace_home,
-                ),
-            ) {
-                Ok(agent) => agent,
-                Err(error) => {
-                    let message = format!("Initialization error: {error}");
-                    for request in request_rx {
-                        let _ = request.reply_tx.send(message.clone());
+                )) {
+                    Ok(agent) => agent,
+                    Err(error) => {
+                        let message = format!("Initialization error: {error}");
+                        for request in request_rx {
+                            let _ = request.reply_tx.send(message.clone());
+                        }
+                        return;
                     }
-                    return;
-                }
-            };
+                };
 
             for request in request_rx {
-                let response = runtime.block_on(agent.run(&request.session_id, &request.user_message));
+                let response =
+                    runtime.block_on(agent.run(&request.session_id, &request.user_message));
                 let _ = request.reply_tx.send(response);
             }
         });

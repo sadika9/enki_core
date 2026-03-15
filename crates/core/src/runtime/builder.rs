@@ -3,6 +3,7 @@ use crate::llm::LlmProvider;
 use crate::memory::MemoryManager;
 use crate::runtime::{Runtime, RuntimeHandler, RuntimeRequest, SessionContext};
 use crate::tooling::tool_calling::ToolExecutor;
+use crate::tooling::types::ToolRegistry;
 use async_trait::async_trait;
 use std::path::PathBuf;
 
@@ -12,6 +13,7 @@ pub struct RuntimeBuilder {
     definition: AgentDefinition,
     llm: Option<Box<dyn LlmProvider>>,
     memory: Option<MemoryManager>,
+    tool_registry: Option<ToolRegistry>,
     tool_executor: Option<Box<dyn ToolExecutor>>,
     workspace_home: Option<PathBuf>,
 }
@@ -22,6 +24,7 @@ impl RuntimeBuilder {
             definition,
             llm: None,
             memory: None,
+            tool_registry: None,
             tool_executor: None,
             workspace_home: None,
         }
@@ -33,6 +36,11 @@ impl RuntimeBuilder {
 
     pub fn with_tool_executor(mut self, tool_executor: Box<dyn ToolExecutor>) -> Self {
         self.tool_executor = Some(tool_executor);
+        self
+    }
+
+    pub fn with_tool_registry(mut self, tool_registry: ToolRegistry) -> Self {
+        self.tool_registry = Some(tool_registry);
         self
     }
 
@@ -61,14 +69,17 @@ impl RuntimeBuilder {
             definition,
             llm,
             memory,
+            tool_registry,
             tool_executor,
             workspace_home,
         } = self;
 
+        let tool_registry = tool_registry.unwrap_or_default();
         let tool_executor = tool_executor
             .unwrap_or_else(|| Box::new(crate::tooling::tool_calling::RegistryToolExecutor));
-        let agent = Agent::with_definition_executor_llm_and_workspace(
+        let agent = Agent::with_definition_tool_registry_executor_llm_and_workspace(
             definition,
+            tool_registry,
             tool_executor,
             llm,
             memory,
