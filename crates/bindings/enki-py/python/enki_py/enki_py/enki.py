@@ -26,6 +26,7 @@ import threading
 import itertools
 import traceback
 import typing
+import asyncio
 import platform
 
 
@@ -478,7 +479,9 @@ def _uniffi_check_contract_api_version(lib):
         raise InternalError("UniFFI contract version mismatch: try cleaning and rebuilding your project")
 
 def _uniffi_check_api_checksums(lib):
-    if lib.uniffi_enki_py_checksum_func_add() != 57421:
+    if lib.uniffi_enki_py_checksum_constructor_enkiagent_new() != 48417:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_enki_py_checksum_method_enkiagent_run() != 59297:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
 
 # A ctypes library to expose the extern-C FFI definitions.
@@ -743,39 +746,110 @@ _UniffiLib.ffi_enki_py_rust_future_free_void.argtypes = (
     ctypes.c_uint64,
 )
 _UniffiLib.ffi_enki_py_rust_future_free_void.restype = None
-_UniffiLib.uniffi_enki_py_fn_func_add.argtypes = (
-    ctypes.c_uint32,
-    ctypes.c_uint32,
+_UniffiLib.uniffi_enki_py_fn_clone_enkiagent.argtypes = (
+    ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
-_UniffiLib.uniffi_enki_py_fn_func_add.restype = ctypes.c_uint32
+_UniffiLib.uniffi_enki_py_fn_clone_enkiagent.restype = ctypes.c_uint64
+_UniffiLib.uniffi_enki_py_fn_free_enkiagent.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_enki_py_fn_free_enkiagent.restype = None
+_UniffiLib.uniffi_enki_py_fn_constructor_enkiagent_new.argtypes = (
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    ctypes.c_uint32,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_enki_py_fn_constructor_enkiagent_new.restype = ctypes.c_uint64
+_UniffiLib.uniffi_enki_py_fn_method_enkiagent_run.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+)
+_UniffiLib.uniffi_enki_py_fn_method_enkiagent_run.restype = ctypes.c_uint64
 _UniffiLib.ffi_enki_py_uniffi_contract_version.argtypes = (
 )
 _UniffiLib.ffi_enki_py_uniffi_contract_version.restype = ctypes.c_uint32
-_UniffiLib.uniffi_enki_py_checksum_func_add.argtypes = (
+_UniffiLib.uniffi_enki_py_checksum_constructor_enkiagent_new.argtypes = (
 )
-_UniffiLib.uniffi_enki_py_checksum_func_add.restype = ctypes.c_uint16
+_UniffiLib.uniffi_enki_py_checksum_constructor_enkiagent_new.restype = ctypes.c_uint16
+_UniffiLib.uniffi_enki_py_checksum_method_enkiagent_run.argtypes = (
+)
+_UniffiLib.uniffi_enki_py_checksum_method_enkiagent_run.restype = ctypes.c_uint16
 
 _uniffi_check_contract_api_version(_UniffiLib)
 # _uniffi_check_api_checksums(_UniffiLib)
 
+# RustFuturePoll values
+_UNIFFI_RUST_FUTURE_POLL_READY = 0
+_UNIFFI_RUST_FUTURE_POLL_WAKE = 1
 
+# Stores futures for _uniffi_continuation_callback
+_UniffiContinuationHandleMap = _UniffiHandleMap()
+
+_UNIFFI_GLOBAL_EVENT_LOOP = None
+
+"""
+Set the event loop to use for async functions
+
+This is needed if some async functions run outside of the eventloop, for example:
+    - A non-eventloop thread is spawned, maybe from `EventLoop.run_in_executor` or maybe from the
+      Rust code spawning its own thread.
+    - The Rust code calls an async callback method from a sync callback function, using something
+      like `pollster` to block on the async call.
+
+In this case, we need an event loop to run the Python async function, but there's no eventloop set
+for the thread.  Use `uniffi_set_event_loop` to force an eventloop to be used in this case.
+"""
+def uniffi_set_event_loop(eventloop: asyncio.BaseEventLoop):
+    global _UNIFFI_GLOBAL_EVENT_LOOP
+    _UNIFFI_GLOBAL_EVENT_LOOP = eventloop
+
+def _uniffi_get_event_loop():
+    if _UNIFFI_GLOBAL_EVENT_LOOP is not None:
+        return _UNIFFI_GLOBAL_EVENT_LOOP
+    else:
+        return asyncio.get_running_loop()
+
+# Continuation callback for async functions
+# lift the return value or error and resolve the future, causing the async function to resume.
+@_UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK
+def _uniffi_continuation_callback(future_ptr, poll_code):
+    (eventloop, future) = _UniffiContinuationHandleMap.remove(future_ptr)
+    eventloop.call_soon_threadsafe(_uniffi_set_future_result, future, poll_code)
+
+def _uniffi_set_future_result(future, poll_code):
+    if not future.cancelled():
+        future.set_result(poll_code)
+
+async def _uniffi_rust_call_async(rust_future, ffi_poll, ffi_complete, ffi_free, lift_func, error_ffi_converter):
+    try:
+        eventloop = _uniffi_get_event_loop()
+
+        # Loop and poll until we see a _UNIFFI_RUST_FUTURE_POLL_READY value
+        while True:
+            future = eventloop.create_future()
+            ffi_poll(
+                rust_future,
+                _uniffi_continuation_callback,
+                _UniffiContinuationHandleMap.insert((eventloop, future)),
+            )
+            poll_code = await future
+            if poll_code == _UNIFFI_RUST_FUTURE_POLL_READY:
+                break
+
+        return lift_func(
+            _uniffi_rust_call_with_error(error_ffi_converter, ffi_complete, rust_future)
+        )
+    finally:
+        ffi_free(rust_future)
 
 # Public interface members begin here.
 
-
-class _UniffiFfiConverterUInt32(_UniffiConverterPrimitiveInt):
-    CLASS_NAME = "u32"
-    VALUE_MIN = 0
-    VALUE_MAX = 2**32
-
-    @staticmethod
-    def read(buf):
-        return buf.read_u32()
-
-    @staticmethod
-    def write(value, buf):
-        buf.write_u32(value)
 
 class _UniffiFfiConverterString:
     @staticmethod
@@ -808,25 +882,150 @@ class _UniffiFfiConverterString:
         with _UniffiRustBuffer.alloc_with_builder() as builder:
             builder.write(value.encode("utf-8"))
             return builder.finalize()
-def add(a: int,b: int) -> int:
-    
-    _UniffiFfiConverterUInt32.check_lower(a)
 
-    _UniffiFfiConverterUInt32.check_lower(b)
-    _uniffi_lowered_args = (
-        _UniffiFfiConverterUInt32.lower(a),
-        _UniffiFfiConverterUInt32.lower(b),
-    )
-    _uniffi_lift_return = _UniffiFfiConverterUInt32.lift
-    _uniffi_error_converter = None
-    _uniffi_ffi_result = _uniffi_rust_call_with_error(
-        _uniffi_error_converter,
-        _UniffiLib.uniffi_enki_py_fn_func_add,
-        *_uniffi_lowered_args,
-    )
-    return _uniffi_lift_return(_uniffi_ffi_result)
+
+class EnkiAgentProtocol(typing.Protocol):
+    
+    async def run(self, session_id: str,user_message: str) -> str:
+        raise NotImplementedError
+
+class EnkiAgent(EnkiAgentProtocol):
+    
+    _handle: ctypes.c_uint64
+    def __init__(self, name: str,system_prompt_preamble: str,model: str,max_iterations: int,workspace_home: typing.Optional[str]):
+        
+        _UniffiFfiConverterString.check_lower(name)
+
+        _UniffiFfiConverterString.check_lower(system_prompt_preamble)
+
+        _UniffiFfiConverterString.check_lower(model)
+
+        _UniffiFfiConverterUInt32.check_lower(max_iterations)
+
+        _UniffiFfiConverterOptionalString.check_lower(workspace_home)
+        _uniffi_lowered_args = (
+            _UniffiFfiConverterString.lower(name),
+            _UniffiFfiConverterString.lower(system_prompt_preamble),
+            _UniffiFfiConverterString.lower(model),
+            _UniffiFfiConverterUInt32.lower(max_iterations),
+            _UniffiFfiConverterOptionalString.lower(workspace_home),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypeEnkiAgent.lift
+        _uniffi_error_converter = None
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_enki_py_fn_constructor_enkiagent_new,
+            *_uniffi_lowered_args,
+        )
+        self._handle = _uniffi_ffi_result
+
+    def __del__(self):
+        # In case of partial initialization of instances.
+        handle = getattr(self, "_handle", None)
+        if handle is not None:
+            _uniffi_rust_call(_UniffiLib.uniffi_enki_py_fn_free_enkiagent, handle)
+
+    def _uniffi_clone_handle(self):
+        return _uniffi_rust_call(_UniffiLib.uniffi_enki_py_fn_clone_enkiagent, self._handle)
+
+    # Used by alternative constructors or any methods which return this type.
+    @classmethod
+    def _uniffi_make_instance(cls, handle):
+        # Lightly yucky way to bypass the usual __init__ logic
+        # and just create a new instance with the required handle.
+        inst = cls.__new__(cls)
+        inst._handle = handle
+        return inst
+    async def run(self, session_id: str,user_message: str) -> str:
+        
+        _UniffiFfiConverterString.check_lower(session_id)
+
+        _UniffiFfiConverterString.check_lower(user_message)
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+            _UniffiFfiConverterString.lower(session_id),
+            _UniffiFfiConverterString.lower(user_message),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterString.lift
+        _uniffi_error_converter = None
+        return await _uniffi_rust_call_async(
+            _UniffiLib.uniffi_enki_py_fn_method_enkiagent_run(*_uniffi_lowered_args),
+            _UniffiLib.ffi_enki_py_rust_future_poll_rust_buffer,
+            _UniffiLib.ffi_enki_py_rust_future_complete_rust_buffer,
+            _UniffiLib.ffi_enki_py_rust_future_free_rust_buffer,
+            _uniffi_lift_return,
+            _uniffi_error_converter,
+        )
+
+
+
+
+
+class _UniffiFfiConverterTypeEnkiAgent:
+    @staticmethod
+    def lift(value: int) -> EnkiAgent:
+        return EnkiAgent._uniffi_make_instance(value)
+
+    @staticmethod
+    def check_lower(value: EnkiAgent):
+        if not isinstance(value, EnkiAgent):
+            raise TypeError("Expected EnkiAgent instance, {} found".format(type(value).__name__))
+
+    @staticmethod
+    def lower(value: EnkiAgent) -> ctypes.c_uint64:
+        return value._uniffi_clone_handle()
+
+    @classmethod
+    def read(cls, buf: _UniffiRustBuffer) -> EnkiAgent:
+        ptr = buf.read_u64()
+        if ptr == 0:
+            raise InternalError("Raw handle value was null")
+        return cls.lift(ptr)
+
+    @classmethod
+    def write(cls, value: EnkiAgent, buf: _UniffiRustBuffer):
+        buf.write_u64(cls.lower(value))
+
+class _UniffiFfiConverterUInt32(_UniffiConverterPrimitiveInt):
+    CLASS_NAME = "u32"
+    VALUE_MIN = 0
+    VALUE_MAX = 2**32
+
+    @staticmethod
+    def read(buf):
+        return buf.read_u32()
+
+    @staticmethod
+    def write(value, buf):
+        buf.write_u32(value)
+
+class _UniffiFfiConverterOptionalString(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterString.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterString.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterString.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
 
 __all__ = [
     "InternalError",
-    "add",
+    "EnkiAgent",
+    "EnkiAgentProtocol",
 ]

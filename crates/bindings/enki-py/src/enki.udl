@@ -1,3 +1,10 @@
-namespace example {
-  u32 add(u32 a, u32 b);
+namespace enki {
+};
+
+interface EnkiAgent {
+  [Name=new]
+  constructor(string name, string system_prompt_preamble, string model, u32 max_iterations, string? workspace_home);
+
+  [Async]
+  string run(string session_id, string user_message);
 };

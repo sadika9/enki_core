@@ -9,7 +9,9 @@ name = "enki_py"
 crate-type = ["cdylib"]
 
 [dependencies]
-uniffi = "0.31.0"
+core_next = { package = "core", path = "../../core" }
+tokio.workspace = true
+uniffi = { version = "0.31.0", features = ["tokio"] }
 
 [build-dependencies]
 uniffi = { version = "0.31.0", features = ["build"] }

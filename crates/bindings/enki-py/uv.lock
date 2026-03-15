@@ -20,6 +20,9 @@ wheels = [
 name = "enki-py"
 source = { editable = "." }
 dependencies = [
+    { name = "pytest", version = "8.3.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.9'" },
+    { name = "pytest", version = "8.4.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.9.*'" },
+    { name = "pytest", version = "9.0.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
     { name = "uniffi-bindgen" },
 ]
 
@@ -32,6 +35,7 @@ tests = [
 
 [package.metadata]
 requires-dist = [
+    { name = "pytest", specifier = ">=8.3.5" },
     { name = "pytest", marker = "extra == 'tests'" },
     { name = "uniffi-bindgen", specifier = ">=0.31.0" },
 ]

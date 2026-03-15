@@ -12,6 +12,7 @@ classifiers = [
 ]
 dynamic = ["version"]
 dependencies = [
+    "pytest>=8.3.5",
     "uniffi-bindgen>=0.31.0",
 ]
 [project.optional-dependencies]
