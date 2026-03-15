@@ -1,6 +1,5 @@
 use async_trait::async_trait;
 use core_next::agent::{Agent, AgentDefinition};
-use core_next::default_tool_registry;
 use core_next::tooling::tool_calling::RegistryToolExecutor;
 use core_next::tooling::types::{Tool, ToolContext, ToolRegistry};
 use serde_json::Value;
@@ -61,13 +60,8 @@ impl Tool for PythonTool {
 fn build_tool_registry(
     tools: Vec<EnkiToolSpec>,
     handler: Arc<dyn EnkiToolHandler>,
-    include_builtin_tools: bool,
 ) -> Result<ToolRegistry, String> {
-    let mut registry = if include_builtin_tools {
-        default_tool_registry()
-    } else {
-        ToolRegistry::new()
-    };
+    let mut registry = ToolRegistry::new();
 
     for tool in tools {
         let parameters = serde_json::from_str::<Value>(&tool.parameters_json).map_err(|error| {
@@ -149,7 +143,7 @@ impl EnkiAgent {
     fn from_registry(
         definition: AgentDefinition,
         workspace_home: Option<String>,
-        include_builtin_tools: bool,
+        _include_builtin_tools: bool,
     ) -> Self {
         let workspace_home = workspace_home.map(PathBuf::from);
         let (request_tx, request_rx) = mpsc::channel::<RunRequest>();
@@ -173,11 +167,7 @@ impl EnkiAgent {
             let agent =
                 match runtime.block_on(Agent::with_definition_tool_registry_executor_and_workspace(
                     definition,
-                    if include_builtin_tools {
-                        default_tool_registry()
-                    } else {
-                        ToolRegistry::new()
-                    },
+                    ToolRegistry::new(),
                     Box::new(RegistryToolExecutor),
                     workspace_home,
                 )) {
@@ -208,7 +198,7 @@ impl EnkiAgent {
         workspace_home: Option<String>,
         tools: Vec<EnkiToolSpec>,
         handler: Box<dyn EnkiToolHandler>,
-        include_builtin_tools: bool,
+        _include_builtin_tools: bool,
     ) -> Self {
         let workspace_home = workspace_home.map(PathBuf::from);
         let (request_tx, request_rx) = mpsc::channel::<RunRequest>();
@@ -230,7 +220,7 @@ impl EnkiAgent {
             };
 
             let tool_registry =
-                match build_tool_registry(tools, Arc::from(handler), include_builtin_tools) {
+                match build_tool_registry(tools, Arc::from(handler)) {
                     Ok(tool_registry) => tool_registry,
                     Err(error) => {
                         let message = format!("Initialization error: {error}");
