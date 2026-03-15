@@ -1,21 +1,6 @@
-#[macro_use]
-mod macros;
-pub mod agent;
-pub mod llm;
-pub mod memory;
-pub mod message;
-pub mod runtime;
-pub mod tooling;
-
-use crate::llm::UniversalLLMClient;
-use crate::runtime::{CliChannel, RuntimeBuilder};
-use crate::tooling::builtin_tools::{ExecTool, ReadFileTool, WriteFileTool};
-use crate::tooling::types::*;
+use core_next::llm::UniversalLLMClient;
+use core_next::runtime::{CliChannel, RuntimeBuilder};
 use std::env;
-
-fn build_tools() -> ToolRegistry {
-    register_tools![ReadFileTool, WriteFileTool, ExecTool]
-}
 
 #[tokio::main]
 async fn main() {

@@ -1,7 +1,7 @@
 mod workspace;
 
 use crate::agent::workspace::AgentWorkspace;
-use crate::build_tools;
+use crate::default_tool_registry;
 use crate::llm::{
     ChatMessage, LlmConfig, LlmProvider, MessageRole, ToolDefinition, UniversalLLMClient,
 };
@@ -63,11 +63,11 @@ impl Agent {
             .map_err(|_| "Missing model. Set AgentDefinition.model or ENKI_MODEL.".to_string())
     }
 
-    pub(crate) async fn new() -> Result<Self, String> {
+    pub async fn new() -> Result<Self, String> {
         Self::with_definition(AgentDefinition::default()).await
     }
 
-    pub(crate) async fn with_definition(definition: AgentDefinition) -> Result<Self, String> {
+    pub async fn with_definition(definition: AgentDefinition) -> Result<Self, String> {
         Self::with_definition_executor_llm_and_workspace(
             definition,
             Box::new(RegistryToolExecutor),
@@ -78,7 +78,7 @@ impl Agent {
         .await
     }
 
-    pub(crate) async fn with_definition_and_executor(
+    pub async fn with_definition_and_executor(
         definition: AgentDefinition,
         tool_executor: Box<dyn ToolExecutor>,
     ) -> Result<Self, String> {
@@ -92,7 +92,7 @@ impl Agent {
         .await
     }
 
-    pub(crate) async fn with_definition_executor_and_workspace(
+    pub async fn with_definition_executor_and_workspace(
         definition: AgentDefinition,
         tool_executor: Box<dyn ToolExecutor>,
         workspace_home: Option<PathBuf>,
@@ -107,7 +107,7 @@ impl Agent {
         .await
     }
 
-    pub(crate) async fn with_definition_executor_llm_and_workspace(
+    pub async fn with_definition_executor_llm_and_workspace(
         definition: AgentDefinition,
         tool_executor: Box<dyn ToolExecutor>,
         llm: Option<Box<dyn LlmProvider>>,
@@ -129,7 +129,7 @@ impl Agent {
             memory: memory
                 .unwrap_or_else(|| MemoryManager::with_defaults(workspace.memory_dir.clone())),
             definition,
-            tool_registry: ToolCallRegistry::new(build_tools()),
+            tool_registry: ToolCallRegistry::new(default_tool_registry()),
             tool_executor,
             workspace,
         })
@@ -541,7 +541,7 @@ Current task workspace: {}
         Ok(StepOutcome::Final(content))
     }
 
-    pub(crate) async fn run(&self, session_id: &str, user_message: &str) -> String {
+    pub async fn run(&self, session_id: &str, user_message: &str) -> String {
         let ctx = self.workspace.tool_context(session_id);
         if let Err(e) = tokio::fs::create_dir_all(&ctx.workspace_dir).await {
             return format!("Workspace error: {e}");
