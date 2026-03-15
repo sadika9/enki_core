@@ -1,6 +1,16 @@
+from . import enki_py as _low_level
+from .agent import Agent, AgentRunResult, RunContext
+from .simple_agent import ExternalTool, SimpleAgent, context_tool, plain_tool
 from .enki_py import *
 
 
-__doc__ = enki_py.__doc__
-if hasattr(enki_py, "__all__"):
-    __all__ = enki_py.__all__
+__doc__ = _low_level.__doc__
+__all__ = list(getattr(_low_level, "__all__", [])) + [
+    "Agent",
+    "AgentRunResult",
+    "ExternalTool",
+    "RunContext",
+    "SimpleAgent",
+    "context_tool",
+    "plain_tool",
+]
