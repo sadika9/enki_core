@@ -100,7 +100,6 @@ impl EnkiAgent {
         model: String,
         max_iterations: u32,
         workspace_home: Option<String>,
-        include_builtin_tools: bool,
     ) -> Self {
         Self::from_registry(
             AgentDefinition {
@@ -110,7 +109,6 @@ impl EnkiAgent {
                 max_iterations: max_iterations as usize,
             },
             workspace_home,
-            include_builtin_tools,
         )
     }
 
@@ -122,7 +120,6 @@ impl EnkiAgent {
         workspace_home: Option<String>,
         tools: Vec<EnkiToolSpec>,
         handler: Box<dyn EnkiToolHandler>,
-        include_builtin_tools: bool,
     ) -> Self {
         let definition = AgentDefinition {
             name,
@@ -136,14 +133,12 @@ impl EnkiAgent {
             workspace_home,
             tools,
             handler,
-            include_builtin_tools,
         )
     }
 
     fn from_registry(
         definition: AgentDefinition,
         workspace_home: Option<String>,
-        _include_builtin_tools: bool,
     ) -> Self {
         let workspace_home = workspace_home.map(PathBuf::from);
         let (request_tx, request_rx) = mpsc::channel::<RunRequest>();
@@ -198,7 +193,6 @@ impl EnkiAgent {
         workspace_home: Option<String>,
         tools: Vec<EnkiToolSpec>,
         handler: Box<dyn EnkiToolHandler>,
-        _include_builtin_tools: bool,
     ) -> Self {
         let workspace_home = workspace_home.map(PathBuf::from);
         let (request_tx, request_rx) = mpsc::channel::<RunRequest>();
