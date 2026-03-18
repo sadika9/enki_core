@@ -1,4 +1,4 @@
-name: CI
+name: CI-JS
 env:
   DEBUG: napi:*
   APP_NAME: enki-js
@@ -8,6 +8,8 @@ env:
   push:
     branches:
       - main
+      - master
+      - devops-release
     tags-ignore:
       - '**'
     paths-ignore:
